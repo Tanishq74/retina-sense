@@ -1,0 +1,146 @@
+{
+  "individual_models": {
+    "ViT-B16": {
+      "macro_f1": 0.8207391181706672,
+      "weighted_f1": 0.8316232070213112,
+      "accuracy": 82.2599531615925,
+      "macro_auc": 0.967306733087025,
+      "per_class_f1": {
+        "Normal": 0.7302504816955683,
+        "Diabetes/DR": 0.8683812405446294,
+        "Glaucoma": 0.84375,
+        "Cataract": 0.8613138686131387,
+        "AMD": 0.8
+      }
+    },
+    "EffNet-B3-Ext": {
+      "macro_f1": 0.6553415983701031,
+      "weighted_f1": 0.7671703093023632,
+      "accuracy": 74.41451990632318,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.6085997794928335,
+        "Diabetes/DR": 0.8507157464212679,
+        "Glaucoma": 0.5279187817258882,
+        "Cataract": 0.7894736842105263,
+        "AMD": 0.5
+      }
+    },
+    "EffNet-B3-v2": {
+      "macro_f1": 0.5173076261721228,
+      "weighted_f1": 0.6837200689381233,
+      "accuracy": 63.58313817330211,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.5353418308227115,
+        "Diabetes/DR": 0.7786840674279499,
+        "Glaucoma": 0.3463203463203463,
+        "Cataract": 0.6590909090909091,
+        "AMD": 0.2671009771986971
+      }
+    }
+  },
+  "ensemble_strategies": {
+    "simple_avg": {
+      "macro_f1": 0.7363006180169005,
+      "weighted_f1": 0.8006848389248435,
+      "accuracy": 78.68852459016394,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.6799601196410767,
+        "Diabetes/DR": 0.858745537990821,
+        "Glaucoma": 0.6666666666666667,
+        "Cataract": 0.8137931034482758,
+        "AMD": 0.6623376623376623
+      }
+    },
+    "weighted_avg": {
+      "macro_f1": 0.7730513713642353,
+      "weighted_f1": 0.8151942939354919,
+      "accuracy": 80.38641686182669,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.7031249999999999,
+        "Diabetes/DR": 0.8643981716607415,
+        "Glaucoma": 0.7222222222222222,
+        "Cataract": 0.8309859154929577,
+        "AMD": 0.7445255474452553
+      }
+    },
+    "optimized_avg": {
+      "macro_f1": 0.818675193402423,
+      "weighted_f1": 0.8322674041243232,
+      "accuracy": 82.31850117096019,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.7307692307692307,
+        "Diabetes/DR": 0.869959677419355,
+        "Glaucoma": 0.8125,
+        "Cataract": 0.8676470588235294,
+        "AMD": 0.8125
+      }
+    },
+    "majority_vote": {
+      "macro_f1": 0.6874560653467514,
+      "weighted_f1": 0.7817119067079518,
+      "accuracy": 76.288056206089,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.6485922836287801,
+        "Diabetes/DR": 0.8520225294418842,
+        "Glaucoma": 0.5536723163841808,
+        "Cataract": 0.8163265306122449,
+        "AMD": 0.5666666666666667
+      }
+    },
+    "thresh_optimized": {
+      "macro_f1": 0.8449122063454197,
+      "weighted_f1": 0.8154727095450387,
+      "accuracy": 80.26932084309134,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.7114556416881997,
+        "Diabetes/DR": 0.842323651452282,
+        "Glaucoma": 0.8076923076923077,
+        "Cataract": 0.943089430894309,
+        "AMD": 0.9199999999999999
+      },
+      "thresholds": {
+        "Normal": 0.1,
+        "Diabetes/DR": 0.26,
+        "Glaucoma": 0.8800000000000001,
+        "Cataract": 0.8400000000000001,
+        "AMD": 0.8200000000000002
+      }
+    },
+    "vit_thresh": {
+      "macro_f1": 0.8575632991730405,
+      "weighted_f1": 0.8170403644924404,
+      "accuracy": 80.44496487119439,
+      "macro_auc": 0.0,
+      "per_class_f1": {
+        "Normal": 0.7132987910189983,
+        "Diabetes/DR": 0.8405194805194806,
+        "Glaucoma": 0.8623853211009175,
+        "Cataract": 0.9516129032258064,
+        "AMD": 0.9199999999999999
+      },
+      "thresholds": {
+        "Normal": 0.1,
+        "Diabetes/DR": 0.30000000000000004,
+        "Glaucoma": 0.68,
+        "Cataract": 0.7600000000000001,
+        "AMD": 0.8600000000000001
+      }
+    }
+  },
+  "best_method": "ENS:vit_thresh",
+  "best_macro_f1": 0.8575632991730405,
+  "improvement_over_best_individual": 0.03682418100237328,
+  "best_individual": "ViT-B16",
+  "optimized_weights": {
+    "ViT-B16": 0.8499999999999999,
+    "EffNet-B3-Ext": 0.1,
+    "EffNet-B3-v2": 0.05000000000000013
+  }
+}

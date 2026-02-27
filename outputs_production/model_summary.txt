@@ -1,0 +1,51 @@
+
+================================================================================
+RETINASENSE PRODUCTION MODEL - SUMMARY
+================================================================================
+
+MODEL ARCHITECTURE:
+  - ViT-Base-Patch16-224 (Vision Transformer)
+  - Parameters: 86,525,194
+  - Input Size: 224×224×3
+  - Output: 5 disease classes + 5 DR severity levels
+
+PERFORMANCE (With Optimal Thresholds):
+  - Validation Accuracy: 84.48%
+  - Macro F1 Score: 0.840
+  - Weighted F1 Score: 0.852
+  - Macro AUC-ROC: 0.967
+
+PER-CLASS F1 SCORES:
+  - Normal         : 0.746
+  - Diabetes/DR    : 0.891
+  - Glaucoma       : 0.871
+  - Cataract       : 0.874
+  - AMD            : 0.819
+
+OPTIMAL THRESHOLDS:
+  - Normal         : 0.540
+  - Diabetes/DR    : 0.240
+  - Glaucoma       : 0.810
+  - Cataract       : 0.930
+  - AMD            : 0.850
+
+DEPLOYMENT FILES:
+  - Model Checkpoint: ./outputs_production/best_model.pth
+  - TorchScript Model: ./outputs_production/model_traced.pt
+  - Configuration: ./outputs_production/deployment_config.json
+  - Visualizations: ./outputs_production/*.png
+
+USAGE:
+  1. Load model checkpoint
+  2. Preprocess image with Ben Graham method
+  3. Get model predictions (probabilities)
+  4. Apply per-class thresholds
+  5. Flag low-confidence cases for review
+
+CLINICAL NOTES:
+  - High recall on rare diseases (AMD, Glaucoma)
+  - Lenient threshold for DR (catch all cases)
+  - Strict thresholds for rare diseases (avoid false positives)
+  - Flag cases below threshold for expert review
+
+================================================================================

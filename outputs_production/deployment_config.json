@@ -1,0 +1,23 @@
+{
+  "optimal_thresholds": {
+    "0": 0.54,
+    "1": 0.24,
+    "2": 0.81,
+    "3": 0.93,
+    "4": 0.85
+  },
+  "class_names": [
+    "Normal",
+    "Diabetes/DR",
+    "Glaucoma",
+    "Cataract",
+    "AMD"
+  ],
+  "model_architecture": "ViT-Base-Patch16-224",
+  "image_size": 224,
+  "performance": {
+    "accuracy": 84.4847775175644,
+    "macro_f1": 0.8400784994441797,
+    "macro_auc": 0.96729783568971
+  }
+}
