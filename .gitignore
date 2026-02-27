@@ -1,18 +1,103 @@
+# RetinaSense Project .gitignore
+
+# Large model files (too big for GitHub)
+*.pth
+*.pt
+*.h5
+*.onnx
+*.pb
+
+# Preprocessed data and cache directories
+preprocessed_cache/
+preprocessed_cache_vit/
+data/
+aptos/
+odir/
+
+# Output directories (models and results)
+outputs/
+outputs_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Large data files
+*.csv
+*.zip
+*.tar.gz
+*.pkl
+*.pickle
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# System files
 /.bashrc
 /.cache
 /.claude
 /.claude.json
 /.config
 /.gitconfig
-/.idea
-/.ipython
 /.kaggle
 /.lightning_studio
 /.lightningignore
 /.npm
 /.nv
 /.vimrc
-/.vscode
 /.zcompdump
 /.zsh_history
 /.zshrc
@@ -29,3 +114,16 @@
 /.sudo_as_admin_successful
 /.vscode-server
 /.windsurf-server
+
+# Keep structure but ignore contents
+!outputs/.gitkeep
+!data/.gitkeep
+!preprocessed_cache/.gitkeep
+
+# Exported conversations
+*.txt
+2026-*
+
+# Allow .gitkeep files
+!.gitkeep
+!**/.gitkeep
