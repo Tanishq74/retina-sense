@@ -33,15 +33,21 @@ IMG_SIZE = 224
 NUM_CLASSES = 5
 CLASS_NAMES = ['Normal', 'Diabetes/DR', 'Glaucoma', 'Cataract', 'AMD']
 SEVERITY_NAMES = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
-BASE_DIR = '/teamspace/studios/this_studio'
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
+
+# Config files: look in configs/ first (committed to git), fall back to original locations
+def _cfg(name, subdir):
+    committed = os.path.join(BASE_DIR, 'configs', name)
+    original  = os.path.join(BASE_DIR, subdir, name)
+    return committed if os.path.exists(committed) else original
 
 # Load configs
-with open(os.path.join(BASE_DIR, 'data/fundus_norm_stats.json')) as f:
+with open(_cfg('fundus_norm_stats.json', 'data')) as f:
     ns = json.load(f)
 NORM_MEAN, NORM_STD = ns['mean_rgb'], ns['std_rgb']
-with open(os.path.join(BASE_DIR, 'outputs_v3/temperature.json')) as f:
+with open(_cfg('temperature.json', 'outputs_v3')) as f:
     T_OPT = json.load(f)['temperature']
-with open(os.path.join(BASE_DIR, 'outputs_v3/thresholds.json')) as f:
+with open(_cfg('thresholds.json', 'outputs_v3')) as f:
     THRESHOLDS = json.load(f)['thresholds']
 
 
@@ -70,7 +76,7 @@ class MultiTaskViT(nn.Module):
 
 
 model = MultiTaskViT().to(DEVICE)
-ckpt = torch.load(os.path.join(BASE_DIR, 'outputs_v3/best_model.pth'),
+ckpt = torch.load(os.path.join(BASE_DIR, 'outputs_v3', 'best_model.pth'),
                    map_location=DEVICE, weights_only=False)
 model.load_state_dict(ckpt['model_state_dict'])
 model.eval()
