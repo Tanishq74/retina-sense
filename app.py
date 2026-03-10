@@ -28,12 +28,17 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 IMG_SIZE = 224
 NUM_CLASSES = 5
 CLASS_NAMES = ['Normal', 'Diabetes/DR', 'Glaucoma', 'Cataract', 'AMD']
-BASE_DIR = '/teamspace/studios/this_studio'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, 'outputs_v3/best_model.pth')
-TEMP_PATH = os.path.join(BASE_DIR, 'outputs_v3/temperature.json')
-THRESH_PATH = os.path.join(BASE_DIR, 'outputs_v3/thresholds.json')
-NORM_PATH = os.path.join(BASE_DIR, 'data/fundus_norm_stats.json')
-OOD_PATH = os.path.join(BASE_DIR, 'outputs_v3/ood_detector')
+# Config files: look in configs/ first (committed to git), fall back to outputs_v3/
+def _cfg(name, subdir):
+    committed = os.path.join(BASE_DIR, 'configs', name)
+    original  = os.path.join(BASE_DIR, subdir, name)
+    return committed if os.path.exists(committed) else original
+TEMP_PATH   = _cfg('temperature.json',        'outputs_v3')
+THRESH_PATH = _cfg('thresholds.json',         'outputs_v3')
+NORM_PATH   = _cfg('fundus_norm_stats.json',  'data')
+OOD_PATH    = os.path.join(BASE_DIR, 'outputs_v3/ood_detector')
 
 # Load config files
 with open(NORM_PATH) as f:

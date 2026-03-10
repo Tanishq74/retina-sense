@@ -24,6 +24,10 @@ preprocessed_cache_vit/
 outputs/
 outputs_*/
 
+# ===== Committed config exceptions =====
+!configs/
+!configs/*.json
+
 # ===== Python =====
 __pycache__/
 *.py[cod]
