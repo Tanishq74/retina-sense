@@ -31,29 +31,42 @@ MODEL_PATH="$REPO_DIR/outputs_v3/best_model.pth"
 if [ -f "$MODEL_PATH" ]; then
     echo "  best_model.pth already present. Skipping download."
 else
-    echo ""
-    echo "  ╔══════════════════════════════════════════════════════════════╗"
-    echo "  ║  MODEL WEIGHTS NOT FOUND (outputs_v3/best_model.pth)        ║"
-    echo "  ║                                                              ║"
-    echo "  ║  The trained model (~331MB) is not stored in git.           ║"
-    echo "  ║  You have two options:                                       ║"
-    echo "  ║                                                              ║"
-    echo "  ║  Option A — Download from remote server (if you have SSH):  ║"
-    echo "  ║    scp user@server:/teamspace/studios/this_studio/           ║"
-    echo "  ║              outputs_v3/best_model.pth outputs_v3/          ║"
-    echo "  ║                                                              ║"
-    echo "  ║  Option B — Upload via Hugging Face Hub (recommended):      ║"
-    echo "  ║    On the GPU server, run:                                   ║"
-    echo "  ║      pip install huggingface_hub                             ║"
-    echo "  ║      python scripts/upload_model_to_hf.py                   ║"
-    echo "  ║    Then here, run:                                           ║"
-    echo "  ║      python scripts/download_model_from_hf.py               ║"
-    echo "  ║                                                              ║"
-    echo "  ║  Option C — Place the file manually:                        ║"
-    echo "  ║    Copy best_model.pth into outputs_v3/best_model.pth       ║"
-    echo "  ╚══════════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "  Continuing setup. The app will fail to start until the model is placed."
+    echo "  Downloading best_model.pth from Hugging Face Hub..."
+    pip install -q huggingface_hub
+    python - <<'PYEOF'
+from huggingface_hub import hf_hub_download
+import shutil, os
+
+path = hf_hub_download(
+    repo_id="tanishq74/retinasense-vit",
+    filename="best_model.pth",
+    repo_type="model",
+)
+os.makedirs("outputs_v3", exist_ok=True)
+shutil.copy(path, "outputs_v3/best_model.pth")
+print("  Downloaded: outputs_v3/best_model.pth")
+PYEOF
+fi
+
+# Download EfficientNet-B3 ensemble weights
+EFFNET_PATH="$REPO_DIR/outputs_v3/ensemble/efficientnet_b3.pth"
+if [ -f "$EFFNET_PATH" ]; then
+    echo "  efficientnet_b3.pth already present. Skipping download."
+else
+    echo "  Downloading efficientnet_b3.pth from Hugging Face Hub..."
+    python - <<'PYEOF'
+from huggingface_hub import hf_hub_download
+import shutil, os
+
+path = hf_hub_download(
+    repo_id="tanishq74/retinasense-vit",
+    filename="efficientnet_b3.pth",
+    repo_type="model",
+)
+os.makedirs("outputs_v3/ensemble", exist_ok=True)
+shutil.copy(path, "outputs_v3/ensemble/efficientnet_b3.pth")
+print("  Downloaded: outputs_v3/ensemble/efficientnet_b3.pth")
+PYEOF
 fi
 
 # ── 4. Verify config files ─────────────────────────────────────────────────────
