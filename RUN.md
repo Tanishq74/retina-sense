@@ -495,9 +495,44 @@ def load_image(row):
 
 ---
 
-## 13. Quick-Start Commands
+## 13. Model Weights — Hugging Face Hub
+
+Model weights are NOT in git (too large). They are hosted on Hugging Face:
+
+**Repo:** https://huggingface.co/tanishq74/retinasense-vit
+
+| File | Size | Description |
+|------|------|-------------|
+| `best_model.pth` | 331MB | ViT-Base/16 trained checkpoint (epoch 24) |
+| `efficientnet_b3.pth` | 45MB | EfficientNet-B3 ensemble checkpoint |
+
+**Download automatically (run once):**
+```bash
+bash setup.sh    # handles everything including model download
+```
+
+**Or download manually:**
+```python
+from huggingface_hub import hf_hub_download
+import shutil, os
+
+os.makedirs("outputs_v3/ensemble", exist_ok=True)
+for fname, dest in [
+    ("best_model.pth",       "outputs_v3/best_model.pth"),
+    ("efficientnet_b3.pth",  "outputs_v3/ensemble/efficientnet_b3.pth"),
+]:
+    path = hf_hub_download(repo_id="tanishq74/retinasense-vit", filename=fname)
+    shutil.copy(path, dest)
+```
+
+---
+
+## 14. Quick-Start Commands
 
 ```bash
+# Full local setup from scratch (cloned repo):
+bash setup.sh                        # installs deps + downloads models from HF
+
 # Check what's already been generated
 ls outputs_v3/evaluation/ outputs_v3/uncertainty/ outputs_v3/xai/ outputs_v3/fairness/ outputs_v3/ensemble/
 
@@ -525,7 +560,7 @@ ps aux | grep python | grep -v grep
 
 ---
 
-## 14. Paper Writing Notes
+## 15. Paper Writing Notes
 
 Use these numbers in the paper:
 
