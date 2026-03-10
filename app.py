@@ -83,7 +83,46 @@ model = MultiTaskViT().to(DEVICE)
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
 model.load_state_dict(ckpt['model_state_dict'])
 model.eval()
-print(f'  Loaded checkpoint epoch {ckpt["epoch"]+1}, val_acc={ckpt["val_acc"]:.2f}%')
+print(f'  Loaded ViT checkpoint epoch {ckpt["epoch"]+1}, val_acc={ckpt["val_acc"]:.2f}%')
+
+
+# ================================================================
+# EFFICIENTNET-B3 (ENSEMBLE)
+# ================================================================
+class EfficientNetB3(nn.Module):
+    def __init__(self, n_classes=NUM_CLASSES, drop=0.3):
+        super().__init__()
+        self.backbone = timm.create_model('efficientnet_b3', pretrained=False, num_classes=0)
+        feat_dim = self.backbone.num_features  # 1536
+        self.drop = nn.Dropout(drop)
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, n_classes),
+        )
+
+    def forward(self, x):
+        f = self.backbone(x)
+        f = self.drop(f)
+        return self.head(f)
+
+
+ENSEMBLE_PATH = os.path.join(BASE_DIR, 'outputs_v3/ensemble/efficientnet_b3.pth')
+ENSEMBLE_WEIGHT_VIT = 0.35
+ENSEMBLE_WEIGHT_EFF = 0.65
+USE_ENSEMBLE = False
+
+if os.path.exists(ENSEMBLE_PATH):
+    print('Loading EfficientNet-B3 for ensemble...')
+    eff_model = EfficientNetB3().to(DEVICE)
+    eff_ckpt = torch.load(ENSEMBLE_PATH, map_location=DEVICE, weights_only=False)
+    eff_model.load_state_dict(eff_ckpt['model_state_dict'])
+    eff_model.eval()
+    USE_ENSEMBLE = True
+    print(f'  Loaded EfficientNet-B3 (epoch {eff_ckpt["epoch"]+1}, F1={eff_ckpt["macro_f1"]:.4f})')
+    print(f'  Ensemble weights: ViT={ENSEMBLE_WEIGHT_VIT}, EfficientNet={ENSEMBLE_WEIGHT_EFF}')
+else:
+    print('  EfficientNet-B3 not found — running ViT-only mode')
 
 
 # ================================================================
@@ -239,19 +278,52 @@ if os.path.exists(OOD_PATH + '.npz'):
 
 
 # ================================================================
-# PREPROCESSING
+# PREPROCESSING (matches training pipeline in retinasense_v3.py)
 # ================================================================
-def preprocess_image(img_pil):
-    """Preprocess PIL image for model input."""
-    img_np = np.array(img_pil.convert('RGB'))
-    img_resized = cv2.resize(img_np, (IMG_SIZE, IMG_SIZE))
+def _crop_black_borders(img, tol=7):
+    """Remove dark border padding common in fundus images."""
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    mask = gray > tol
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    if not rows.any() or not cols.any():
+        return img
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    return img[rmin:rmax+1, cmin:cmax+1]
 
-    # Auto-detect domain: if image has dark borders, likely fundus
-    # Apply CLAHE as default preprocessing
+
+def _apply_circular_mask(img):
+    """Zero out pixels outside the circular fundus field of view."""
+    h, w = img.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cx, cy = w // 2, h // 2
+    r = int(min(h, w) * 0.48)
+    cv2.circle(mask, (cx, cy), r, 255, -1)
+    return cv2.bitwise_and(img, img, mask=mask)
+
+
+def preprocess_image(img_pil):
+    """Preprocess PIL image for model input.
+    Matches the training pipeline: crop borders → resize → CLAHE → circular mask → normalize.
+    """
+    img_np = np.array(img_pil.convert('RGB'))
+
+    # Step 1: Crop black borders (same as training)
+    img_cropped = _crop_black_borders(img_np)
+
+    # Step 2: Resize to model input size
+    img_resized = cv2.resize(img_cropped, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+
+    # Step 3: CLAHE on L-channel (default preprocessing — matches ODIR/majority of training data)
     lab = cv2.cvtColor(img_resized, cv2.COLOR_RGB2LAB)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     lab[:, :, 0] = clahe.apply(lab[:, :, 0])
     processed = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    # Step 4: Circular mask (critical — model trained with black outside fundus circle)
+    processed = _apply_circular_mask(processed)
+    processed = np.clip(processed, 0, 255).astype(np.uint8)
 
     normalize = transforms.Normalize(NORM_MEAN, NORM_STD)
     transform = transforms.Compose([
@@ -293,13 +365,14 @@ def get_recommendation(pred_class, severity_idx=0):
 # ================================================================
 # REPORT GENERATION
 # ================================================================
-def generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag):
+def generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag, triage_key='REVIEW', models_agree=True, vit_pred=0, eff_pred=0):
     lines = []
     lines.append('=' * 60)
     lines.append('  RETINASENSE-ViT CLINICAL SCREENING REPORT')
     lines.append('=' * 60)
     lines.append(f'  Date: {time.strftime("%Y-%m-%d %H:%M:%S")}')
-    lines.append(f'  Model: ViT-Base/16 (RetinaSense v3.0)')
+    model_name = 'ViT-Base/16 + EfficientNet-B3 Ensemble' if USE_ENSEMBLE else 'ViT-Base/16'
+    lines.append(f'  Model: {model_name} (RetinaSense v3.0)')
     lines.append('')
     lines.append('  PRIMARY FINDING')
     lines.append(f'  Prediction: {CLASS_NAMES[pred_class]}')
@@ -320,8 +393,20 @@ def generate_report_text(pred_class, confidence, probs, severity_idx, uncertaint
     lines.append(f'  Aleatoric (data):     {uncertainty["aleatoric"]:.4f}')
     lines.append('')
     lines.append('  OUT-OF-DISTRIBUTION CHECK')
-    lines.append(f'  Mahalanobis score: {ood_score:.2f} (threshold: {ood.ood_threshold:.2f})')
-    lines.append(f'  Status: {"WARNING - Image may be outside training distribution" if ood_flag else "PASS - Within distribution"}')
+    if ood.ood_threshold is not None:
+        lines.append(f'  Mahalanobis score: {ood_score:.2f} (threshold: {ood.ood_threshold:.2f})')
+        lines.append(f'  Status: {"WARNING - Image may be outside training distribution" if ood_flag else "PASS - Within distribution"}')
+    else:
+        lines.append('  OOD detector not available (ood_detector.npz missing)')
+        lines.append('  Status: SKIPPED')
+    lines.append('')
+    triage = TRIAGE_LEVELS[triage_key]
+    lines.append('  CLINICAL TRIAGE')
+    lines.append(f'  Triage Level: {triage["label"]}')
+    lines.append(f'  {triage["desc"]}')
+    if USE_ENSEMBLE:
+        agree_str = "AGREE" if models_agree else f"DISAGREE (ViT: {CLASS_NAMES[vit_pred]}, EfficientNet: {CLASS_NAMES[eff_pred]})"
+        lines.append(f'  Model Agreement: {agree_str}')
     lines.append('')
     lines.append('  CLINICAL RECOMMENDATION')
     lines.append(f'  {get_recommendation(pred_class, severity_idx)}')
@@ -339,6 +424,105 @@ def generate_report_text(pred_class, confidence, probs, severity_idx, uncertaint
 
 
 # ================================================================
+# TEST-TIME AUGMENTATION (TTA)
+# ================================================================
+def _tta_augment(tensor):
+    """Generate augmented versions of input tensor for TTA."""
+    augmented = [tensor]  # original
+    t = tensor.squeeze(0)  # (3, H, W)
+    augmented.append(torch.flip(t, dims=[2]).unsqueeze(0))    # horizontal flip
+    augmented.append(torch.flip(t, dims=[1]).unsqueeze(0))    # vertical flip
+    # +10 degree rotation
+    angle = 10.0 * (3.14159 / 180.0)
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    theta1 = torch.tensor([[cos_a, -sin_a, 0], [sin_a, cos_a, 0]], dtype=torch.float32).unsqueeze(0)
+    grid1 = F.affine_grid(theta1, tensor.size(), align_corners=False)
+    augmented.append(F.grid_sample(tensor, grid1, align_corners=False))
+    # -10 degree rotation
+    theta2 = torch.tensor([[cos_a, sin_a, 0], [-sin_a, cos_a, 0]], dtype=torch.float32).unsqueeze(0)
+    grid2 = F.affine_grid(theta2, tensor.size(), align_corners=False)
+    augmented.append(F.grid_sample(tensor, grid2, align_corners=False))
+    return augmented
+
+
+def tta_predict(tensor_list):
+    """Run both models on all TTA augmentations and average probabilities."""
+    all_vit_probs = []
+    all_eff_probs = []
+    all_sev_probs = []
+
+    with torch.no_grad():
+        for t in tensor_list:
+            t = t.to(DEVICE)
+            d_out, s_out = model(t)
+            vp = torch.softmax(d_out / T_OPT, dim=1).cpu().numpy()[0]
+            sp = torch.softmax(s_out, dim=1).cpu().numpy()[0]
+            all_vit_probs.append(vp)
+            all_sev_probs.append(sp)
+
+            if USE_ENSEMBLE:
+                eff_logits = eff_model(t)
+                ep = torch.softmax(eff_logits / T_OPT, dim=1).cpu().numpy()[0]
+                all_eff_probs.append(ep)
+
+    vit_mean = np.mean(all_vit_probs, axis=0)
+    sev_mean = np.mean(all_sev_probs, axis=0)
+
+    if USE_ENSEMBLE:
+        eff_mean = np.mean(all_eff_probs, axis=0)
+        ensemble_probs = ENSEMBLE_WEIGHT_VIT * vit_mean + ENSEMBLE_WEIGHT_EFF * eff_mean
+        return vit_mean, eff_mean, ensemble_probs, sev_mean
+    return vit_mean, None, vit_mean, sev_mean
+
+
+# ================================================================
+# CLINICAL TRIAGE SYSTEM
+# ================================================================
+TRIAGE_LEVELS = {
+    'AUTO_SCREEN': {
+        'label': 'AUTO-SCREEN',
+        'color': '🟢',
+        'desc': 'Low risk — routine re-screening recommended.',
+    },
+    'REVIEW': {
+        'label': 'PRIORITY REVIEW',
+        'color': '🟡',
+        'desc': 'Moderate risk — schedule specialist review within 2 weeks.',
+    },
+    'URGENT': {
+        'label': 'URGENT SPECIALIST',
+        'color': '🔴',
+        'desc': 'High risk — refer to specialist within 48 hours.',
+    },
+    'REJECT': {
+        'label': 'RESCAN NEEDED',
+        'color': '⚪',
+        'desc': 'Image quality insufficient or out-of-distribution — rescan required.',
+    },
+}
+
+def compute_triage(pred_class, confidence, uncertainty, ood_flag, models_agree):
+    """Uncertainty-guided clinical triage decision."""
+    ent = uncertainty['predictive_entropy']
+    epist = uncertainty['epistemic']
+
+    # REJECT: OOD detected
+    if ood_flag:
+        return 'REJECT'
+
+    # URGENT: low confidence OR high uncertainty OR models disagree on disease
+    if confidence < 0.4 or ent > 1.2 or (not models_agree and confidence < 0.6):
+        return 'URGENT'
+
+    # PRIORITY REVIEW: moderate confidence, or elevated epistemic uncertainty
+    if confidence < 0.7 or ent > 0.7 or epist > 0.05 or not models_agree:
+        return 'REVIEW'
+
+    # AUTO-SCREEN: high confidence, low uncertainty, models agree
+    return 'AUTO_SCREEN'
+
+
+# ================================================================
 # MAIN PREDICTION FUNCTION
 # ================================================================
 def predict(image):
@@ -348,39 +532,66 @@ def predict(image):
     img_pil = Image.fromarray(image) if isinstance(image, np.ndarray) else image
     tensor, img_orig, img_processed = preprocess_image(img_pil)
 
-    # 1. Attention Rollout + prediction
-    heatmap, pred_class, confidence, probs, sev_probs = rollout.generate(tensor)
+    # 1. Attention Rollout + heatmap (on original tensor)
+    heatmap, vit_pred_class, vit_confidence, vit_probs_single, sev_probs_single = rollout.generate(tensor)
     overlay_img = rollout.overlay(img_orig, heatmap)
 
-    # 2. MC Dropout uncertainty
+    # 2. TTA: run predictions on augmented versions
+    tta_tensors = _tta_augment(tensor)
+    vit_probs, eff_probs_arr, probs, sev_probs = tta_predict(tta_tensors)
+
+    pred_class = int(probs.argmax())
+    confidence = float(probs[pred_class])
+
+    # 3. Model agreement check
+    vit_pred = int(vit_probs.argmax())
+    if USE_ENSEMBLE and eff_probs_arr is not None:
+        eff_pred = int(eff_probs_arr.argmax())
+        models_agree = (vit_pred == eff_pred)
+    else:
+        eff_pred = vit_pred
+        models_agree = True
+
+    # 4. MC Dropout uncertainty
     uncertainty = mc_dropout_predict(tensor, T=15)
 
-    # 3. OOD detection
+    # 5. OOD detection
     with torch.no_grad():
         feat = model.backbone(tensor.to(DEVICE)).cpu().numpy()[0]
     ood_score, ood_flag = ood.score(feat)
 
-    # 4. Severity (if DR)
+    # 6. Clinical triage
+    triage_key = compute_triage(pred_class, confidence, uncertainty, ood_flag, models_agree)
+    triage = TRIAGE_LEVELS[triage_key]
+
+    # 7. Severity (if DR)
     severity_idx = int(sev_probs.argmax()) if pred_class == 1 else 0
 
-    # 5. Build probability display
+    # 8. Build probability display
     prob_dict = {cn: float(probs[i]) for i, cn in enumerate(CLASS_NAMES)}
 
-    # 6. Build status text
+    # 9. Build status text
     ent = uncertainty['predictive_entropy']
     unc_level = 'Low' if ent < 0.5 else ('Moderate' if ent < 1.0 else 'HIGH')
+    mode_str = "Ensemble + TTA" if USE_ENSEMBLE else "ViT-Base/16 + TTA"
 
     status_parts = []
-    status_parts.append(f"Prediction: **{CLASS_NAMES[pred_class]}** ({confidence*100:.1f}%)")
+    status_parts.append(f"**Mode: {mode_str}**")
+    status_parts.append(f"### {triage['color']} Triage: {triage['label']}")
+    status_parts.append(f"*{triage['desc']}*")
+    status_parts.append(f"\nPrediction: **{CLASS_NAMES[pred_class]}** ({confidence*100:.1f}%)")
     if pred_class == 1:
         status_parts.append(f"DR Severity: **{SEVERITY_NAMES[severity_idx]}**")
+    if USE_ENSEMBLE:
+        agree_str = "AGREE" if models_agree else f"DISAGREE (ViT: {CLASS_NAMES[vit_pred]}, EfficientNet: {CLASS_NAMES[eff_pred]})"
+        status_parts.append(f"Model Agreement: **{agree_str}**")
     status_parts.append(f"Uncertainty: **{unc_level}** (entropy={ent:.3f})")
-    status_parts.append(f"OOD Score: {ood_score:.1f} {'(WARNING)' if ood_flag else '(OK)'}")
     status_parts.append(f"\n**Recommendation:** {get_recommendation(pred_class, severity_idx)}")
     status_text = '\n'.join(status_parts)
 
-    # 7. Generate report
-    report = generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag)
+    # 10. Generate report
+    report = generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag,
+                                  triage_key=triage_key, models_agree=models_agree, vit_pred=vit_pred, eff_pred=eff_pred)
     report_path = os.path.join(tempfile.gettempdir(), 'retinasense_report.txt')
     with open(report_path, 'w') as f:
         f.write(report)
@@ -394,7 +605,7 @@ def predict(image):
 with gr.Blocks(title="RetinaSense-ViT", theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
     # RetinaSense-ViT Clinical Screening System
-    **AI-Powered Retinal Disease Detection** | ViT-Base/16 | 5 Disease Classes | Attention Rollout XAI
+    **AI-Powered Retinal Disease Detection** | ViT + EfficientNet Ensemble | 5 Disease Classes | Attention Rollout XAI
 
     Upload a fundus image to get instant disease screening with explainability, uncertainty quantification, and clinical recommendations.
     """)
@@ -428,7 +639,7 @@ with gr.Blocks(title="RetinaSense-ViT", theme=gr.themes.Soft()) as demo:
     It is NOT a medical device and should NOT be used for clinical decision-making
     without verification by a qualified ophthalmologist.
 
-    **Model:** ViT-Base/16 fine-tuned on APTOS + ODIR datasets | **Classes:** Normal, DR, Glaucoma, Cataract, AMD
+    **Model:** ViT-Base/16 + EfficientNet-B3 Ensemble with TTA | **Classes:** Normal, DR, Glaucoma, Cataract, AMD | **Features:** Attention Rollout XAI, MC Dropout Uncertainty, Clinical Triage
     """)
 
 

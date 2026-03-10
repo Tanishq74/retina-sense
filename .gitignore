@@ -74,6 +74,13 @@ logs/
 *.pkl
 *.pickle
 
+# ===== Gradio cache =====
+.gradio/
+
+# ===== Test artifacts =====
+sample_fundus_test.jpg
+diagnose_model.py
+
 # ===== Temporary files =====
 *.tmp
 *.bak
