@@ -1,0 +1,9 @@
+torch>=2.0
+torchvision
+timm
+fastapi
+uvicorn[standard]
+python-multipart
+Pillow
+numpy
+opencv-python-headless
