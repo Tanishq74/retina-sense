@@ -1,95 +1,87 @@
-# RetinaSense Project .gitignore
+# RetinaSense-ViT .gitignore
 
-# Large model files (too big for GitHub)
+# ===== Large model files =====
 *.pth
 *.pt
 *.h5
 *.onnx
 *.pb
+*.safetensors
 
-# Preprocessed data and cache directories
-preprocessed_cache/
-preprocessed_cache_vit/
-data/
+# ===== Datasets (multi-GB) =====
 aptos/
 odir/
+ocular-disease-recognition-odir5k/
+refuge2/
+data/
 
-# Output directories (models and results)
+# ===== Preprocessed caches =====
+preprocessed_cache/
+preprocessed_cache_v3/
+preprocessed_cache_vit/
+
+# ===== Output directories (models, results, gradcam) =====
 outputs/
 outputs_*/
 
-# Python
+# ===== Python =====
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
 eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
 
-# Jupyter Notebook
-.ipynb_checkpoints
-*/.ipynb_checkpoints/*
+# ===== Jupyter =====
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
 
-# Environment
+# ===== Virtual environments =====
 .env
 .venv
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
 
-# IDEs
+# ===== IDEs =====
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# ===== OS =====
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
-# Logs
+# ===== Logs =====
 *.log
 logs/
 
-# Large data files
+# ===== Large data files =====
 *.csv
 *.zip
 *.tar.gz
 *.pkl
 *.pickle
 
-# Temporary files
+# ===== Temporary files =====
 *.tmp
 *.bak
-*.swp
+.claude.json.tmp*
 
-# System files
+# ===== Claude Code =====
+.claude.json
+.claude/
+
+# ===== System / dotfiles =====
 /.bashrc
 /.cache
-/.claude
-/.claude.json
 /.config
 /.gitconfig
 /.kaggle
@@ -114,16 +106,3 @@ logs/
 /.sudo_as_admin_successful
 /.vscode-server
 /.windsurf-server
-
-# Keep structure but ignore contents
-!outputs/.gitkeep
-!data/.gitkeep
-!preprocessed_cache/.gitkeep
-
-# Exported conversations
-*.txt
-2026-*
-
-# Allow .gitkeep files
-!.gitkeep
-!**/.gitkeep
