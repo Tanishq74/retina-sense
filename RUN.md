@@ -4,6 +4,45 @@
 
 ---
 
+## 0. Local Setup (Start Here If Cloning for the First Time)
+
+The project was originally developed on a remote GPU server. All paths are now
+**relative** — the code works on any machine. Run this once after cloning:
+
+```bash
+git clone https://github.com/Tanishq74/retina-sense
+cd retina-sense
+bash setup.sh
+```
+
+`setup.sh` does everything automatically:
+1. Installs all Python dependencies (torch CPU build + timm, gradio, fastapi, etc.)
+2. Creates `outputs_v3/` and `data/` directories
+3. Downloads `best_model.pth` (331MB) from Hugging Face Hub → `outputs_v3/`
+4. Downloads `efficientnet_b3.pth` (45MB) from Hugging Face Hub → `outputs_v3/ensemble/`
+5. Verifies `configs/` JSON files are present (they are committed to git)
+
+After setup completes:
+```bash
+python app.py    # Gradio web demo → http://localhost:7860 (also generates public URL)
+```
+
+**What is and isn't in git:**
+
+| File | In git? | How to get it |
+|------|---------|---------------|
+| All `.py` scripts | Yes | `git clone` |
+| `configs/*.json` | Yes | `git clone` (temperature, thresholds, norm stats) |
+| `outputs_v3/best_model.pth` | No (331MB) | `bash setup.sh` → auto-downloads from HF |
+| `outputs_v3/ensemble/efficientnet_b3.pth` | No (45MB) | `bash setup.sh` → auto-downloads from HF |
+| `outputs_v3/ood_detector.npz` | No | Only on GPU server — app runs fine without it (OOD check skipped) |
+| `data/*.csv` | No (large) | Only on GPU server — only needed for retraining |
+| `preprocessed_cache_v3/` | No (multi-GB) | Only on GPU server — only needed for retraining |
+
+**HF model repo:** https://huggingface.co/tanishq74/retinasense-vit
+
+---
+
 ## 1. Project Overview
 
 **RetinaSense-ViT** is a deep learning system for retinal disease classification from fundus photographs.
@@ -23,7 +62,7 @@
 ## 2. Directory Structure
 
 ```
-/teamspace/studios/this_studio/
+<repo-root>/
 │
 ├── retinasense_v3.py            # Main training script (1220 lines)
 ├── gradcam_v3.py                # Attention Rollout XAI (FIXED, working)
