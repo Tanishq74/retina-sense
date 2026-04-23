@@ -1,4 +1,4 @@
-# 🔬 RetinaSense-ViT: Deep Learning for Retinal Disease Classification
+# RetinaSense-ViT: Deep Learning for Retinal Disease Classification
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)
@@ -6,7 +6,7 @@
 
 A production-ready deep learning system for multi-disease retinal classification achieving **89.30% accuracy** and **0.886 macro F1** using Vision Transformers with Domain-Adversarial Neural Network (DANN) training.
 
-## 🎯 Project Overview
+## Project Overview
 
 RetinaSense-ViT is an AI-powered system for automated detection of five major retinal diseases from fundus images:
 - **Normal** (healthy retina)
