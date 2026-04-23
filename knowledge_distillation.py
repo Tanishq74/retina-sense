@@ -37,11 +37,17 @@ KD_TEMP    = 4.0    # temperature for soft targets
 BASE_LR    = 3e-4
 NUM_WORKERS= 4
 
-with open('./data/fundus_norm_stats.json') as f:
+# Norm stats: prefer configs/ then data/
+_norm_candidates = ['./configs/fundus_norm_stats_unified.json', './configs/fundus_norm_stats.json', './data/fundus_norm_stats.json']
+_norm_path = next((p for p in _norm_candidates if os.path.exists(p)), _norm_candidates[-1])
+with open(_norm_path) as f:
     ns = json.load(f)
 NORM_MEAN, NORM_STD = ns['mean_rgb'], ns['std_rgb']
 
-with open('./outputs_v3/temperature.json') as f:
+# Temperature: prefer configs/ then outputs_v3/
+_temp_candidates = ['./configs/temperature.json', './outputs_v3/temperature.json']
+_temp_path = next((p for p in _temp_candidates if os.path.exists(p)), _temp_candidates[-1])
+with open(_temp_path) as f:
     T_OPT = json.load(f)['temperature']
 
 print('=' * 65)
@@ -72,9 +78,22 @@ class MultiTaskViT(nn.Module):
         f = self.backbone(x); f = self.drop(f)
         return self.disease_head(f), self.severity_head(f)
 
+# Teacher model: prefer DANN-v3 -> DANN-v2 -> DANN -> original
+_teacher_candidates = [
+    './outputs_v3/dann_v3/best_model.pth',
+    './outputs_v3/dann_v2/best_model.pth',
+    './outputs_v3/dann/best_model.pth',
+    './outputs_v3/best_model.pth',
+]
+_teacher_path = next((p for p in _teacher_candidates if os.path.exists(p)), _teacher_candidates[-1])
+
 teacher = MultiTaskViT().to(DEVICE)
-ckpt = torch.load('./outputs_v3/best_model.pth', map_location=DEVICE, weights_only=False)
-teacher.load_state_dict(ckpt['model_state_dict'])
+ckpt = torch.load(_teacher_path, map_location=DEVICE, weights_only=False)
+# Filter out DANN domain_head/grl keys if present
+_state = ckpt['model_state_dict']
+_filtered = {k: v for k, v in _state.items()
+             if not k.startswith('domain_head') and not k.startswith('grl')}
+teacher.load_state_dict(_filtered, strict=False)
 teacher.eval()
 for p in teacher.parameters():
     p.requires_grad_(False)
@@ -296,7 +315,7 @@ m_teacher = metrics(t_preds, t_labels, t_probs, 'Teacher (ViT-Base)')
 m_student = metrics(s_preds, s_labels, s_probs, 'Student (ViT-Tiny)')
 retention = m_student['macro_f1'] / m_teacher['macro_f1'] * 100
 print(f'\n  Performance retention: {retention:.1f}%')
-print(f'  Size reduction: {os.path.getsize("./outputs_v3/best_model.pth")/1e6:.0f}MB → {os.path.getsize(student_path)/1e6:.0f}MB')
+print(f'  Size reduction: {os.path.getsize(_teacher_path)/1e6:.0f}MB → {os.path.getsize(student_path)/1e6:.0f}MB')
 
 
 # ================================================================
@@ -362,13 +381,13 @@ except Exception as e:
 # Save summary
 results = {
     'teacher': {'architecture': 'vit_base_patch16_224', 'params': teacher_params,
-                'size_mb': os.path.getsize('./outputs_v3/best_model.pth')/1e6,
+                'size_mb': os.path.getsize(_teacher_path)/1e6,
                 **m_teacher},
     'student': {'architecture': 'vit_tiny_patch16_224', 'params': student_params,
                 'size_mb': os.path.getsize(student_path)/1e6, **m_student},
     'onnx_size_mb': os.path.getsize(onnx_path)/1e6,
     'performance_retention_pct': retention,
-    'size_reduction_factor': os.path.getsize('./outputs_v3/best_model.pth') / os.path.getsize(student_path),
+    'size_reduction_factor': os.path.getsize(_teacher_path) / os.path.getsize(student_path),
 }
 with open(os.path.join(OUTPUT_DIR, 'compression_results.json'), 'w') as f:
     json.dump(results, f, indent=2)

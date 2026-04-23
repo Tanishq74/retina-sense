@@ -45,15 +45,25 @@ torch.set_num_threads(os.cpu_count() or 4)
 # ================================================================
 # CONFIGURATION
 # ================================================================
-BASE_DIR   = '/teamspace/studios/this_studio'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs_v3')
 XAI_DIR    = os.path.join(OUTPUT_DIR, 'xai')
 os.makedirs(XAI_DIR, exist_ok=True)
 
-MODEL_PATH       = os.path.join(OUTPUT_DIR, 'best_model.pth')
-TEMPERATURE_PATH = os.path.join(OUTPUT_DIR, 'temperature.json')
+MODEL_PATH = next(
+    (p for p in [
+        os.path.join(OUTPUT_DIR, 'dann_v3', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'dann_v2', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'dann', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'best_model.pth'),
+    ] if os.path.exists(p)),
+    os.path.join(OUTPUT_DIR, 'best_model.pth')
+)
+TEMPERATURE_PATH = os.path.join(BASE_DIR, 'configs', 'temperature.json')
 TEST_CSV         = os.path.join(BASE_DIR, 'data', 'test_split.csv')
-NORM_STATS_PATH  = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
+NORM_STATS_PATH  = os.path.join(BASE_DIR, 'configs', 'fundus_norm_stats_unified.json')
+if not os.path.exists(NORM_STATS_PATH):
+    NORM_STATS_PATH = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
 
 CLASS_NAMES = ['Normal', 'Diabetes/DR', 'Glaucoma', 'Cataract', 'AMD']
 NUM_CLASSES = 5
@@ -516,10 +526,15 @@ def main():
     print('\n[1/6] Loading model...')
     model = MultiTaskViT().to(DEVICE)
     ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
+    state_dict = ckpt['model_state_dict']
+    # Filter out DANN domain_head/grl keys if present
+    filtered = {k: v for k, v in state_dict.items()
+                if not k.startswith('domain_head') and not k.startswith('grl')}
+    model.load_state_dict(filtered, strict=False)
     model.eval()
     print(f'  Loaded: {MODEL_PATH}')
-    print(f'  Checkpoint epoch: {ckpt.get("epoch", "?") + 1}')
+    epoch = ckpt.get("epoch", -1)
+    print(f'  Checkpoint epoch: {epoch + 1 if isinstance(epoch, int) else epoch}')
 
     # ---- 2. Select images ----
     print('\n[2/6] Selecting test images...')

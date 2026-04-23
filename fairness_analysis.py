@@ -50,15 +50,25 @@ from scipy import stats
 # ================================================================
 # CONFIGURATION
 # ================================================================
-BASE_DIR = '/teamspace/studios/this_studio'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs_v3')
 FAIRNESS_DIR = os.path.join(OUTPUT_DIR, 'fairness')
 os.makedirs(FAIRNESS_DIR, exist_ok=True)
 
-MODEL_PATH = os.path.join(OUTPUT_DIR, 'best_model.pth')
+MODEL_PATH = next(
+    (p for p in [
+        os.path.join(OUTPUT_DIR, 'dann_v3', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'dann_v2', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'dann', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'best_model.pth'),
+    ] if os.path.exists(p)),
+    os.path.join(OUTPUT_DIR, 'best_model.pth')
+)
 TEST_CSV = os.path.join(BASE_DIR, 'data', 'test_split.csv')
-NORM_STATS_PATH = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
-TEMPERATURE_PATH = os.path.join(OUTPUT_DIR, 'temperature.json')
+NORM_STATS_PATH = os.path.join(BASE_DIR, 'configs', 'fundus_norm_stats_unified.json')
+if not os.path.exists(NORM_STATS_PATH):
+    NORM_STATS_PATH = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
+TEMPERATURE_PATH = os.path.join(BASE_DIR, 'configs', 'temperature.json')
 
 NUM_CLASSES = 5
 IMG_SIZE = 224
@@ -137,7 +147,10 @@ class MultiTaskViT(nn.Module):
 print('\nLoading model...')
 model = MultiTaskViT().to(DEVICE)
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-model.load_state_dict(ckpt['model_state_dict'])
+state_dict = ckpt['model_state_dict']
+filtered = {k: v for k, v in state_dict.items()
+            if not k.startswith('domain_head') and not k.startswith('grl')}
+model.load_state_dict(filtered, strict=False)
 model.eval()
 print(f'  Loaded: {MODEL_PATH}')
 print(f'  Checkpoint epoch: {ckpt.get("epoch", "?") + 1}  '
@@ -169,7 +182,7 @@ class FairnessDataset(Dataset):
         label = int(row['disease_label'])
         source = row['source']
 
-        # Try cached .npy first
+        # Try cached .npy first (prefer unified cache)
         cache_path = row.get('cache_path', '')
         if isinstance(cache_path, str) and cache_path:
             # Resolve relative path
@@ -178,6 +191,10 @@ class FairnessDataset(Dataset):
                 while clean.startswith('./') or clean.startswith('.//'):
                     clean = clean[2:] if clean.startswith('./') else clean[3:]
                 cache_path = os.path.join(self.base_dir, clean)
+            # Prefer unified cache over v3
+            unified_path = cache_path.replace('preprocessed_cache_v3', 'preprocessed_cache_unified')
+            if os.path.exists(unified_path):
+                cache_path = unified_path
             if os.path.exists(cache_path):
                 img = np.load(cache_path)  # (224,224,3) uint8
                 tensor = self.transform(img)

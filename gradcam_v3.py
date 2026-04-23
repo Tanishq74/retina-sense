@@ -40,16 +40,43 @@ import timm
 # ================================================================
 # CONFIGURATION
 # ================================================================
-BASE_DIR   = '/teamspace/studios/this_studio'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs_v3')
 GRADCAM_DIR = os.path.join(OUTPUT_DIR, 'gradcam')
 os.makedirs(GRADCAM_DIR, exist_ok=True)
 
-MODEL_PATH      = os.path.join(OUTPUT_DIR, 'best_model.pth')
-THRESHOLDS_PATH = os.path.join(OUTPUT_DIR, 'thresholds.json')
-TEMPERATURE_PATH = os.path.join(OUTPUT_DIR, 'temperature.json')
+MODEL_PATH = next(
+    (p for p in [
+        os.path.join(BASE_DIR, 'outputs_v3/dann_v3/best_model.pth'),
+        os.path.join(BASE_DIR, 'outputs_v3/dann_v2/best_model.pth'),
+        os.path.join(BASE_DIR, 'outputs_v3/dann/best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'best_model.pth'),
+    ] if os.path.exists(p)),
+    os.path.join(OUTPUT_DIR, 'best_model.pth')
+)
+THRESHOLDS_PATH = next(
+    (p for p in [
+        os.path.join(BASE_DIR, 'configs', 'thresholds.json'),
+        os.path.join(OUTPUT_DIR, 'thresholds.json'),
+    ] if os.path.exists(p)),
+    os.path.join(OUTPUT_DIR, 'thresholds.json')
+)
+TEMPERATURE_PATH = next(
+    (p for p in [
+        os.path.join(BASE_DIR, 'configs', 'temperature.json'),
+        os.path.join(OUTPUT_DIR, 'temperature.json'),
+    ] if os.path.exists(p)),
+    os.path.join(OUTPUT_DIR, 'temperature.json')
+)
 TEST_CSV        = os.path.join(BASE_DIR, 'data', 'test_split.csv')
-NORM_STATS_PATH = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
+NORM_STATS_PATH = next(
+    (p for p in [
+        os.path.join(BASE_DIR, 'configs', 'fundus_norm_stats_unified.json'),
+        os.path.join(BASE_DIR, 'configs', 'fundus_norm_stats.json'),
+        os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json'),
+    ] if os.path.exists(p)),
+    os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
+)
 
 CLASS_NAMES = ['Normal', 'Diabetes/DR', 'Glaucoma', 'Cataract', 'AMD']
 NUM_CLASSES = 5
@@ -141,7 +168,10 @@ class MultiTaskViT(nn.Module):
 print('\nLoading model...')
 model = MultiTaskViT().to(DEVICE)
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-model.load_state_dict(ckpt['model_state_dict'])
+_state = ckpt['model_state_dict']
+_filtered = {k: v for k, v in _state.items()
+             if not k.startswith('domain_head') and not k.startswith('grl')}
+model.load_state_dict(_filtered, strict=False)
 model.eval()
 print(f'  Loaded: {MODEL_PATH}')
 print(f'  Checkpoint epoch: {ckpt.get("epoch", "?") + 1}  val_acc={ckpt.get("val_acc", 0):.2f}%')
@@ -205,7 +235,7 @@ def load_and_preprocess(image_path, dataset='auto'):
         clean = image_path
         while clean.startswith('./') or clean.startswith('.//'):
             clean = clean[2:] if clean.startswith('./') else clean[3:]
-        image_path = os.path.join(BASE_DIR, clean)thinl
+        image_path = os.path.join(BASE_DIR, clean)
     # Auto-detect domain
     if dataset == 'auto':
         if 'aptos' in image_path.lower() or 'gaussian' in image_path.lower():

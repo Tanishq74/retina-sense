@@ -1,40 +1,36 @@
 #!/usr/bin/env python3
 """
-RetinaSense DANN — Domain-Adversarial Neural Network Training
-=============================================================
-Addresses the domain shift between APTOS (Ben Graham preprocessed) and
-ODIR (CLAHE preprocessed) images that causes poor DR recall (~25.3%).
+RetinaSense DANN v3 — Pushing Toward 90% Accuracy
+====================================================
+Builds on train_dann.py (DANN-v2 achieved 86.1%) with seven key improvements:
 
-Uses a Gradient Reversal Layer (GRL) with a domain discriminator head
-to force the ViT backbone to learn domain-INVARIANT features.
+1. **Expanded dataset**: MESSIDOR-2 as 4th domain (8,241 train samples)
+2. **Hard-example mining**: Oversample top-K hardest examples by 2x each epoch
+3. **Class-balanced batch sampling**: WeightedRandomSampler with inverse-frequency
+4. **Progressive DR alpha boost**: 1.5x -> 3.0x across training
+5. **Cosine annealing with warm restarts**: T_0=10, T_mult=2
+6. **Label smoothing**: 0.1 on disease loss
+7. **Mixup augmentation**: alpha=0.2 on 50% of batches
+8. **Test-Time Augmentation (TTA)**: 8-way (flips + rotations) for final eval
 
-Architecture:
-  - Backbone:       ViT-Base/16 (768-dim) or ViT-Large/16 (1024-dim, for RETFound)
-  - Disease head:   feat -> 512 -> 256 -> 5  (same as MultiTaskViT)
-  - Severity head:  feat -> 256 -> 5          (same as MultiTaskViT)
-  - Domain head:    GRL -> feat -> 256 -> 64 -> num_domains  (NEW)
-  Feature dim is detected dynamically from the backbone (768 or 1024).
-
-Lambda schedule (Ganin et al. 2016):
-  lambda_p = 2 / (1 + exp(-10*p)) - 1,  p = epoch / total_epochs
-
-Loss:
-  L = L_disease + 0.2 * L_severity + domain_weight * lambda_p * L_domain
-
-Warm-starts from the existing best_model.pth checkpoint.
+Architecture is identical to DANNMultiTaskViT from train_dann.py.
+Warm-starts from DANN-v2 checkpoint (outputs_v3/dann_v2/best_model.pth).
 
 Usage:
-  python train_dann.py
-  python train_dann.py --epochs 40 --lr 5e-5 --domain-weight 0.15
-  python train_dann.py --backbone retfound --weights /path/to/RETFound_cfp_weights.pth
+  python train_dann_v3.py
+  python train_dann_v3.py --epochs 50 --lr 2e-5 --tta
+  python train_dann_v3.py --no-warmstart --epochs 60
 """
 
 import os
 import sys
 import time
 import json
+import copy
+import math
 import argparse
 import warnings
+import random
 import numpy as np
 import pandas as pd
 import cv2
@@ -44,7 +40,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from PIL import Image
 from tqdm import tqdm
-from collections import Counter
+from collections import Counter, defaultdict
 
 warnings.filterwarnings('ignore')
 
@@ -52,7 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Sampler
 from torchvision import transforms
 
 import timm
@@ -71,34 +67,51 @@ from sklearn.preprocessing import label_binarize
 # ================================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='RetinaSense DANN — Domain-Adversarial Training',
+        description='RetinaSense DANN v3 — Improved Training for 90% Accuracy',
     )
     parser.add_argument(
-        '--backbone', type=str, default='vit',
-        choices=['vit', 'retfound'],
-        help='Backbone type: "vit" (ViT-Base/16, 768-dim) or "retfound" (ViT-Large/16, 1024-dim)',
+        '--warmstart', type=str, default='outputs_v3/dann_v2/best_model.pth',
+        help='Path to warm-start checkpoint (default: outputs_v3/dann_v2/best_model.pth)',
     )
-    parser.add_argument(
-        '--weights', type=str, default=None,
-        help='Path to RETFound weights file (required if --backbone retfound)',
-    )
-    parser.add_argument(
-        '--warmstart', type=str, default='outputs_v3/best_model.pth',
-        help='Path to warm-start checkpoint (default: outputs_v3/best_model.pth)',
-    )
-    parser.add_argument('--epochs', type=int, default=30, help='Training epochs')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Base learning rate')
-    parser.add_argument(
-        '--domain-weight', type=float, default=0.1,
-        help='Weight multiplier for domain loss (default: 0.1)',
-    )
-    parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
-    parser.add_argument('--workers', type=int, default=8, help='DataLoader workers')
     parser.add_argument('--no-warmstart', action='store_true', help='Skip warm-start')
-    parser.add_argument('--dr-alpha-boost', type=float, default=1.0,
-                        help='Multiply DR focal alpha by this factor (default: 1.0)')
+    parser.add_argument('--epochs', type=int, default=40, help='Training epochs (default: 40)')
+    parser.add_argument('--lr', type=float, default=3e-5, help='Base learning rate (default: 3e-5)')
+    parser.add_argument(
+        '--domain-weight', type=float, default=0.05,
+        help='Weight multiplier for domain loss (default: 0.05)',
+    )
+    parser.add_argument('--batch-size', type=int, default=32, help='Batch size (default: 32)')
+    parser.add_argument('--workers', type=int, default=8, help='DataLoader workers')
     parser.add_argument('--output-dir', type=str, default=None,
-                        help='Override output directory')
+                        help='Override output directory (default: outputs_v3/dann_v3)')
+
+    # -- v3-specific improvements --
+    parser.add_argument('--dr-alpha-start', type=float, default=1.5,
+                        help='DR focal alpha boost at epoch 0 (default: 1.5)')
+    parser.add_argument('--dr-alpha-end', type=float, default=3.0,
+                        help='DR focal alpha boost at final epoch (default: 3.0)')
+    parser.add_argument('--hard-mining-k', type=int, default=500,
+                        help='Number of hard examples to oversample each epoch (default: 500)')
+    parser.add_argument('--hard-mining-factor', type=int, default=2,
+                        help='Oversampling factor for hard examples (default: 2)')
+    parser.add_argument('--mixup-alpha', type=float, default=0.2,
+                        help='Mixup alpha parameter (default: 0.2)')
+    parser.add_argument('--mixup-prob', type=float, default=0.5,
+                        help='Probability of applying mixup per batch (default: 0.5)')
+    parser.add_argument('--label-smoothing', type=float, default=0.1,
+                        help='Label smoothing factor (default: 0.1)')
+    parser.add_argument('--cosine-t0', type=int, default=10,
+                        help='CosineAnnealingWarmRestarts T_0 (default: 10)')
+    parser.add_argument('--cosine-tmult', type=int, default=2,
+                        help='CosineAnnealingWarmRestarts T_mult (default: 2)')
+    parser.add_argument('--tta', action='store_true',
+                        help='Enable Test-Time Augmentation for final evaluation (8-way)')
+    parser.add_argument('--tta-n', type=int, default=8,
+                        help='Number of TTA augmentations (default: 8)')
+    parser.add_argument('--max-lambda', type=float, default=0.3,
+                        help='Cap for Ganin lambda schedule (default: 0.3)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed (default: 42)')
     return parser.parse_args()
 
 
@@ -107,11 +120,11 @@ def parse_args():
 # ================================================================
 class Config:
     DATA_DIR   = './data'
-    OUTPUT_DIR = './outputs_v3/dann'
+    OUTPUT_DIR = './outputs_v3/dann_v3'
 
     MODEL_NAME = 'vit_base_patch16_224'
     IMG_SIZE   = 224
-    FEAT_DIM   = 768  # ViT-Base=768, ViT-Large=1024 (set dynamically for retfound)
+    FEAT_DIM   = 768
 
     NUM_DISEASE_CLASSES  = 5
     NUM_SEVERITY_CLASSES = 5
@@ -119,34 +132,50 @@ class Config:
     DROPOUT = 0.3
 
     BATCH_SIZE  = 32
-    NUM_EPOCHS  = 30
+    NUM_EPOCHS  = 40
     NUM_WORKERS = 8
 
-    BASE_LR      = 1e-4   # lower than initial training since warm-starting
+    BASE_LR      = 3e-5
     LLRD_DECAY   = 0.85
     WEIGHT_DECAY = 1e-4
 
     GRADIENT_ACCUMULATION = 2  # effective batch = 64
 
-    FOCAL_GAMMA    = 1.0
-    MIXUP_ALPHA    = 0.4
+    FOCAL_GAMMA    = 2.0
     DOMAIN_WEIGHT  = 0.05
 
-    PATIENCE  = 12
+    PATIENCE  = 15
     MIN_DELTA = 0.001
 
     CLASS_NAMES = ['Normal', 'Diabetes/DR', 'Glaucoma', 'Cataract', 'AMD']
 
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Paths for 3-way splits
-    TRAIN_CSV = './data/train_split.csv'
-    CALIB_CSV = './data/calib_split.csv'
-    TEST_CSV  = './data/test_split.csv'
+    # Paths for expanded splits
+    TRAIN_CSV = './data/train_split_expanded.csv'
+    CALIB_CSV = './data/calib_split_expanded.csv'
+    TEST_CSV  = './data/test_split.csv'  # sealed — never expanded
+
+    # Fallback splits if expanded not available
+    TRAIN_CSV_FALLBACK = './data/train_split.csv'
+    CALIB_CSV_FALLBACK = './data/calib_split.csv'
 
     # ImageNet fallback normalisation
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+# ================================================================
+# REPRODUCIBILITY
+# ================================================================
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ================================================================
@@ -199,21 +228,16 @@ class DANNMultiTaskViT(nn.Module):
       - severity_head : 5-class DR severity grading
       - domain_head   : N-class domain discriminator (receives GRL features)
 
-    Supports ViT-Base/16 (768-dim) and ViT-Large/16 (1024-dim, for RETFound).
-    Feature dimension is detected dynamically from the backbone.
-
-    The GRL ensures the backbone learns domain-invariant features: gradients
-    from the domain head are reversed before reaching the backbone, so the
-    backbone is penalised for encoding domain-specific information.
+    Feature dim is detected dynamically from the backbone (768 for ViT-Base).
     """
 
-    def __init__(self, n_disease=5, n_severity=5, num_domains=3,
+    def __init__(self, n_disease=5, n_severity=5, num_domains=4,
                  drop=0.3, backbone_name='vit_base_patch16_224'):
         super().__init__()
         self.backbone = timm.create_model(
             backbone_name, pretrained=True, num_classes=0,
         )
-        feat = self.backbone.num_features  # 768 for ViT-Base, 1024 for ViT-Large
+        feat = self.backbone.num_features  # 768 for ViT-Base
 
         self.drop = nn.Dropout(drop)
 
@@ -230,7 +254,7 @@ class DANNMultiTaskViT(nn.Module):
             nn.Linear(256, n_severity),
         )
 
-        # Domain discriminator head (NEW — receives gradient-reversed features)
+        # Domain discriminator head (receives gradient-reversed features)
         self.grl = GRL()
         self.domain_head = nn.Sequential(
             nn.Linear(feat, 256), nn.ReLU(), nn.Dropout(0.3),
@@ -251,31 +275,41 @@ class DANNMultiTaskViT(nn.Module):
         return disease_out, severity_out, domain_out
 
     def forward_no_domain(self, x):
-        """Forward without domain head — for inference."""
+        """Forward without domain head -- for inference."""
         f = self.backbone(x)
         f = self.drop(f)
         return self.disease_head(f), self.severity_head(f)
 
+    def forward_features(self, x):
+        """Return backbone features only (for hard-example mining)."""
+        f = self.backbone(x)
+        return f
+
 
 # ================================================================
-# FOCAL LOSS
+# FOCAL LOSS WITH LABEL SMOOTHING
 # ================================================================
 class FocalLoss(nn.Module):
     """
-    Focal Loss — down-weights easy examples, focuses on hard ones.
+    Focal Loss with optional label smoothing.
     alpha: per-class weight tensor; gamma: focusing parameter.
+    label_smoothing: smoothing factor (0 = no smoothing).
     """
 
-    def __init__(self, alpha=None, gamma=2.0):
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0):
         super().__init__()
         self.gamma = gamma
+        self.label_smoothing = label_smoothing
         if alpha is not None:
             self.register_buffer('alpha', alpha)
         else:
             self.alpha = None
 
     def forward(self, logits, targets):
-        ce    = F.cross_entropy(logits, targets, reduction='none')
+        ce = F.cross_entropy(
+            logits, targets, reduction='none',
+            label_smoothing=self.label_smoothing,
+        )
         pt    = torch.exp(-ce)
         focal = ((1 - pt) ** self.gamma) * ce
         if self.alpha is not None:
@@ -307,7 +341,7 @@ def load_norm_stats():
     # ImageNet fallback
     mean = [0.485, 0.456, 0.406]
     std  = [0.229, 0.224, 0.225]
-    print('  No fundus norm stats found — using ImageNet defaults')
+    print('  No fundus norm stats found -- using ImageNet defaults')
     return mean, std
 
 
@@ -347,12 +381,6 @@ def _circular_mask(img, sz):
     return cv2.bitwise_and(img, img, mask=mask)
 
 
-def ben_graham(path, sz=224, sigma=10):
-    img = cv2.resize(_read_rgb(path), (sz, sz))
-    img = cv2.addWeighted(img, 4, cv2.GaussianBlur(img, (0, 0), sigma), -4, 128)
-    return _circular_mask(img, sz)
-
-
 def clahe_preprocess(path, sz=224):
     img = cv2.resize(_read_rgb(path), (sz, sz))
     lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
@@ -362,28 +390,21 @@ def clahe_preprocess(path, sz=224):
     return _circular_mask(img, sz)
 
 
-def resize_only(path, sz=224):
-    img = cv2.resize(_read_rgb(path), (sz, sz))
-    return _circular_mask(img, sz)
-
-
-def preprocess_image(path, source, sz=224):
-    src = str(source).upper()
-    if src == 'APTOS':
-        return ben_graham(path, sz)
-    if src == 'REFUGE2':
-        return resize_only(path, sz)
+def preprocess_image(path, source='ODIR', sz=224):
+    """Unified CLAHE preprocessing for all sources."""
     return clahe_preprocess(path, sz)
 
 
 # ================================================================
-# DATASET
+# DATASET WITH INDEX TRACKING (for hard-example mining)
 # ================================================================
-class RetinalDANNDataset(Dataset):
+class RetinalDANNv3Dataset(Dataset):
     """
     Retinal fundus dataset with domain labels for DANN training.
+    Returns: (image_tensor, disease_label, severity_label, domain_label, index)
 
-    Returns: (image_tensor, disease_label, severity_label, domain_label)
+    The index is returned so the training loop can track per-sample losses
+    for hard-example mining.
     """
 
     def __init__(self, df, transform, domain_map):
@@ -398,12 +419,14 @@ class RetinalDANNDataset(Dataset):
         row = self.df.iloc[idx]
 
         # Load from cache
-        cache_fp = resolve_cache_path(row.get('cache_path', ''))
+        cache_fp = resolve_cache_path(str(row.get('cache_path', '')))
         try:
             img = np.load(cache_fp)
         except Exception:
             try:
-                img = preprocess_image(row['image_path'], row.get('source', 'ODIR'))
+                img = preprocess_image(
+                    row['image_path'], row.get('source', 'ODIR'),
+                )
             except Exception:
                 img = np.zeros((224, 224, 3), dtype=np.uint8)
 
@@ -423,6 +446,7 @@ class RetinalDANNDataset(Dataset):
             torch.tensor(disease_lbl,  dtype=torch.long),
             torch.tensor(severity_lbl, dtype=torch.long),
             torch.tensor(domain_lbl,   dtype=torch.long),
+            torch.tensor(idx,          dtype=torch.long),
         )
 
 
@@ -454,19 +478,185 @@ def make_transforms(phase, norm_mean, norm_std):
     ])
 
 
+def make_tta_transforms(norm_mean, norm_std, n_augs=8):
+    """
+    Build a list of deterministic TTA transforms.
+    Covers: identity, H-flip, V-flip, HV-flip, 90/180/270 rotations, slight zoom.
+    """
+    normalize = transforms.Normalize(norm_mean, norm_std)
+
+    base = [transforms.ToPILImage()]
+
+    tta_list = []
+
+    # 1. Identity
+    tta_list.append(transforms.Compose([
+        *base, transforms.ToTensor(), normalize,
+    ]))
+
+    # 2. Horizontal flip
+    tta_list.append(transforms.Compose([
+        *base, transforms.RandomHorizontalFlip(p=1.0),
+        transforms.ToTensor(), normalize,
+    ]))
+
+    # 3. Vertical flip
+    tta_list.append(transforms.Compose([
+        *base, transforms.RandomVerticalFlip(p=1.0),
+        transforms.ToTensor(), normalize,
+    ]))
+
+    # 4. H + V flip
+    tta_list.append(transforms.Compose([
+        *base,
+        transforms.RandomHorizontalFlip(p=1.0),
+        transforms.RandomVerticalFlip(p=1.0),
+        transforms.ToTensor(), normalize,
+    ]))
+
+    # 5. 90-degree rotation
+    tta_list.append(transforms.Compose([
+        *base,
+        transforms.Lambda(lambda img: img.rotate(90, expand=False)),
+        transforms.ToTensor(), normalize,
+    ]))
+
+    # 6. 180-degree rotation
+    tta_list.append(transforms.Compose([
+        *base,
+        transforms.Lambda(lambda img: img.rotate(180, expand=False)),
+        transforms.ToTensor(), normalize,
+    ]))
+
+    # 7. 270-degree rotation
+    tta_list.append(transforms.Compose([
+        *base,
+        transforms.Lambda(lambda img: img.rotate(270, expand=False)),
+        transforms.ToTensor(), normalize,
+    ]))
+
+    # 8. Center crop + resize (slight zoom)
+    tta_list.append(transforms.Compose([
+        *base,
+        transforms.CenterCrop(200),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(), normalize,
+    ]))
+
+    return tta_list[:n_augs]
+
+
 # ================================================================
-# WEIGHTED RANDOM SAMPLER
+# HARD-EXAMPLE MINING SAMPLER
 # ================================================================
-def make_weighted_sampler(df, n_classes=5):
-    labels    = df['disease_label'].values
-    class_cnt = np.bincount(labels, minlength=n_classes).astype(float)
-    class_cnt = np.where(class_cnt == 0, 1.0, class_cnt)
-    weights   = 1.0 / class_cnt[labels]
-    return WeightedRandomSampler(
-        weights=torch.DoubleTensor(weights),
-        num_samples=len(weights),
-        replacement=True,
-    )
+class HardExampleMiningWeightedSampler(Sampler):
+    """
+    A weighted sampler that combines class-balancing weights with
+    hard-example boosting. After each epoch, the training loop
+    updates per-sample losses; the top-K hardest examples get their
+    sample weight boosted by `hard_factor`.
+
+    Also specifically boosts DR->Normal misclassifications (class 1
+    predicted as class 0) which were the dominant error mode.
+    """
+
+    def __init__(self, labels, n_classes=5, hard_k=500, hard_factor=2):
+        self.labels      = np.array(labels)
+        self.n_classes   = n_classes
+        self.n_samples   = len(labels)
+        self.hard_k      = hard_k
+        self.hard_factor = hard_factor
+
+        # Base class-balancing weights (inverse frequency)
+        class_cnt = np.bincount(self.labels, minlength=n_classes).astype(float)
+        class_cnt = np.where(class_cnt == 0, 1.0, class_cnt)
+        self.base_weights = 1.0 / class_cnt[self.labels]
+
+        # Per-sample loss tracking (updated each epoch)
+        self.sample_losses = np.zeros(self.n_samples, dtype=np.float64)
+
+        # Misclassification tracking
+        self.sample_wrong  = np.zeros(self.n_samples, dtype=bool)
+        self.sample_pred   = np.full(self.n_samples, -1, dtype=np.int64)
+
+        # Current effective weights
+        self._update_weights()
+
+    def _update_weights(self):
+        """Recompute effective sampling weights from base + hard mining."""
+        weights = self.base_weights.copy()
+
+        if self.sample_losses.sum() > 0:
+            # Boost top-K highest-loss samples
+            top_k_idx = np.argsort(self.sample_losses)[-self.hard_k:]
+            weights[top_k_idx] *= self.hard_factor
+
+            # Extra boost for DR->Normal misclassifications
+            dr_as_normal = (
+                (self.labels == 1) &           # True label is DR
+                self.sample_wrong &            # Was misclassified
+                (self.sample_pred == 0)        # Predicted as Normal
+            )
+            n_dr_normal = dr_as_normal.sum()
+            if n_dr_normal > 0:
+                weights[dr_as_normal] *= self.hard_factor
+                # Print once per update for monitoring
+                pass
+
+        self.effective_weights = torch.DoubleTensor(weights)
+
+    def update_losses(self, indices, losses, preds=None, targets=None):
+        """
+        Update per-sample losses and misclassification info.
+        Called after each epoch by the training loop.
+
+        Args:
+            indices: sample indices (from dataset)
+            losses:  per-sample loss values
+            preds:   predicted class per sample (optional)
+            targets: true class per sample (optional)
+        """
+        idx_np = indices.cpu().numpy() if torch.is_tensor(indices) else np.array(indices)
+        loss_np = losses.cpu().numpy() if torch.is_tensor(losses) else np.array(losses)
+
+        for i, idx in enumerate(idx_np):
+            if 0 <= idx < self.n_samples:
+                self.sample_losses[idx] = loss_np[i]
+
+        if preds is not None and targets is not None:
+            pred_np = preds.cpu().numpy() if torch.is_tensor(preds) else np.array(preds)
+            tgt_np  = targets.cpu().numpy() if torch.is_tensor(targets) else np.array(targets)
+            for i, idx in enumerate(idx_np):
+                if 0 <= idx < self.n_samples:
+                    self.sample_wrong[idx] = (pred_np[i] != tgt_np[i])
+                    self.sample_pred[idx]  = pred_np[i]
+
+        self._update_weights()
+
+    def __iter__(self):
+        return iter(torch.multinomial(
+            self.effective_weights,
+            num_samples=self.n_samples,
+            replacement=True,
+        ).tolist())
+
+    def __len__(self):
+        return self.n_samples
+
+    def get_stats(self):
+        """Return mining stats for logging."""
+        n_hard = min(self.hard_k, (self.sample_losses > 0).sum())
+        n_wrong = self.sample_wrong.sum()
+        dr_as_normal = (
+            (self.labels == 1) &
+            self.sample_wrong &
+            (self.sample_pred == 0)
+        ).sum()
+        return {
+            'hard_samples_tracked': int(n_hard),
+            'wrong_total': int(n_wrong),
+            'dr_as_normal': int(dr_as_normal),
+        }
 
 
 # ================================================================
@@ -475,14 +665,6 @@ def make_weighted_sampler(df, n_classes=5):
 def get_optimizer_with_llrd(model, base_lr, decay_factor, weight_decay=1e-4):
     """
     AdamW with layer-wise learning rate decay (LLRD).
-
-    Groups (N = number of transformer blocks, 12 for ViT-Base, 24 for ViT-Large):
-      - disease_head / severity_head / domain_head / drop : base_lr
-      - blocks[N-1] : base_lr * decay^1
-      - blocks[N-2] : base_lr * decay^2
-      ...
-      - blocks[0]   : base_lr * decay^N
-      - patch_embed + cls_token + pos_embed + norm : base_lr * decay^(N+1)
     """
     param_groups = []
 
@@ -531,10 +713,10 @@ def get_optimizer_with_llrd(model, base_lr, decay_factor, weight_decay=1e-4):
 # ================================================================
 # MIXUP (disease labels only, NOT domain labels)
 # ================================================================
-def mixup_data(x, y_disease, alpha=0.4):
+def mixup_data(x, y_disease, alpha=0.2):
     """
     MixUp augmentation for disease labels.
-    Domain labels are NOT mixed — the discriminator needs clean domain targets.
+    Domain labels are NOT mixed -- the discriminator needs clean domain targets.
     """
     lam        = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     batch_size = x.size(0)
@@ -546,10 +728,10 @@ def mixup_data(x, y_disease, alpha=0.4):
 # ================================================================
 # WARM-START WEIGHT LOADING
 # ================================================================
-def load_warmstart_weights(model, checkpoint_path, device):
+def load_warmstart_weights(model, checkpoint_path, device, num_domains_new=4):
     """
-    Load weights from MultiTaskViT checkpoint into DANNMultiTaskViT.
-    Copies backbone, disease_head, severity_head. Domain head stays random.
+    Load weights from a DANN checkpoint into DANNMultiTaskViT.
+    Handles domain head dimension mismatch (3 domains -> 4 domains).
     """
     if not os.path.exists(checkpoint_path):
         print(f'  WARNING: Warm-start checkpoint not found: {checkpoint_path}')
@@ -559,7 +741,6 @@ def load_warmstart_weights(model, checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt.get('model_state_dict', ckpt)
 
-    # Filter out domain_head keys (they won't exist in old checkpoint)
     model_state = model.state_dict()
     loaded_keys = []
     skipped_keys = []
@@ -585,56 +766,14 @@ def load_warmstart_weights(model, checkpoint_path, device):
     print(f'    Loaded: {n_loaded} params | Skipped: {n_skipped} | '
           f'New (random): {n_new}')
 
-    # Verify domain_head is randomly initialised
-    domain_params = sum(
-        1 for k in model_state if k.startswith('domain_head')
-    )
-    print(f'    Domain head params (random init): {domain_params}')
+    if skipped_keys:
+        print(f'    Skipped keys (shape mismatch or missing):')
+        for k in skipped_keys[:10]:
+            print(f'      - {k}')
+        if len(skipped_keys) > 10:
+            print(f'      ... and {len(skipped_keys) - 10} more')
 
     return True
-
-
-# ================================================================
-# RETFOUND BACKBONE LOADING
-# ================================================================
-def load_retfound_backbone(model, weights_path, device):
-    """Load RETFound weights into the ViT backbone (ViT-Large/16)."""
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f'RETFound weights not found: {weights_path}')
-
-    ckpt = torch.load(weights_path, map_location=device, weights_only=False)
-    state_dict = ckpt.get('model', ckpt.get('state_dict', ckpt))
-
-    # RETFound MAE checkpoint keys to skip (decoder, head, mask token)
-    SKIP_PREFIXES = (
-        'head.', 'fc_norm.', 'decoder.', 'decoder_embed.',
-        'decoder_blocks.', 'decoder_norm.', 'decoder_pred.', 'mask_token',
-    )
-
-    # Map RETFound keys to timm ViT keys
-    backbone_state = model.backbone.state_dict()
-    matched = 0
-    skipped = 0
-    for key, value in state_dict.items():
-        # Strip common prefixes from MAE / DDP checkpoints
-        clean_key = key
-        for prefix in ('model.', 'encoder.', 'module.'):
-            if clean_key.startswith(prefix):
-                clean_key = clean_key[len(prefix):]
-
-        # Skip decoder / head keys that don't belong in the encoder
-        if any(clean_key.startswith(sp) for sp in SKIP_PREFIXES):
-            skipped += 1
-            continue
-
-        if clean_key in backbone_state and backbone_state[clean_key].shape == value.shape:
-            backbone_state[clean_key] = value
-            matched += 1
-
-    model.backbone.load_state_dict(backbone_state)
-    print(f'  RETFound: loaded {matched}/{len(backbone_state)} backbone params '
-          f'(skipped {skipped} decoder/head keys)')
-    return model
 
 
 # ================================================================
@@ -693,6 +832,62 @@ def evaluate_domain(loader, model, device, alpha=1.0):
             total   += dom_lbl.size(0)
 
     return 100.0 * correct / max(total, 1)
+
+
+# ================================================================
+# TEST-TIME AUGMENTATION (TTA)
+# ================================================================
+def evaluate_with_tta(dataset_df, domain_map, model, device,
+                      norm_mean, norm_std, batch_size=32, num_workers=4,
+                      n_augs=8, desc='TTA Eval'):
+    """
+    Run TTA evaluation: for each sample, run n_augs augmented versions
+    and average the softmax probabilities.
+
+    Returns: (probs, targets) -- averaged probs and true labels.
+    """
+    tta_transforms = make_tta_transforms(norm_mean, norm_std, n_augs=n_augs)
+
+    model.eval()
+    n_samples = len(dataset_df)
+    n_classes = 5
+    all_probs = np.zeros((n_samples, n_classes), dtype=np.float64)
+    all_targets = np.zeros(n_samples, dtype=np.int64)
+
+    print(f'  Running TTA with {len(tta_transforms)} augmentations...')
+
+    for aug_idx, tta_tfm in enumerate(tta_transforms):
+        # Build dataset with this specific transform
+        ds = RetinalDANNv3Dataset(dataset_df, tta_tfm, domain_map)
+        loader = DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True,
+        )
+
+        batch_start = 0
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=f'  TTA {aug_idx+1}/{len(tta_transforms)}',
+                              leave=False):
+                imgs  = batch[0].to(device, non_blocking=True)
+                d_lbl = batch[1]
+
+                with autocast('cuda'):
+                    d_out, _ = model.forward_no_domain(imgs)
+
+                probs = torch.softmax(d_out.float(), dim=1).cpu().numpy()
+                bs = probs.shape[0]
+
+                all_probs[batch_start:batch_start+bs] += probs
+                if aug_idx == 0:
+                    all_targets[batch_start:batch_start+bs] = d_lbl.numpy()
+                batch_start += bs
+
+        print(f'    Aug {aug_idx+1}/{len(tta_transforms)} done')
+
+    # Average across augmentations
+    all_probs /= len(tta_transforms)
+
+    return all_probs, all_targets
 
 
 # ================================================================
@@ -791,14 +986,12 @@ def plot_dashboard(history, cfg, output_dir):
     axes[0, 1].legend()
     axes[0, 1].grid(alpha=0.3)
 
-    # 3. Domain accuracy (should converge to ~50% = domain-invariant)
+    # 3. Domain accuracy (should converge toward chance = domain-invariant)
     axes[0, 2].plot(ep, history['train_domain_acc'], 'b-o', ms=3, label='Train')
     axes[0, 2].plot(ep, history['val_domain_acc'],   'r-o', ms=3, label='Val')
-    axes[0, 2].axhline(y=50.0, color='gray', linestyle='--', alpha=0.5,
-                        label='Random (50%)')
-    num_domains = history.get('num_domains', 3)
+    num_domains = history.get('num_domains', 4)
     chance = 100.0 / num_domains
-    axes[0, 2].axhline(y=chance, color='gray', linestyle=':', alpha=0.5,
+    axes[0, 2].axhline(y=chance, color='gray', linestyle='--', alpha=0.5,
                         label=f'Chance ({chance:.0f}%)')
     axes[0, 2].set_title('Domain Accuracy (lower = better alignment)',
                           fontweight='bold')
@@ -822,15 +1015,21 @@ def plot_dashboard(history, cfg, output_dir):
     axes[1, 1].legend(fontsize=8)
     axes[1, 1].grid(alpha=0.3)
 
-    # 6. Lambda schedule
-    axes[1, 2].plot(ep, history['lambda_p'], 'k-o', ms=3, label='Lambda')
-    axes[1, 2].set_title('Ganin Lambda Schedule', fontweight='bold')
-    axes[1, 2].set_xlabel('Epoch')
-    axes[1, 2].legend()
-    axes[1, 2].grid(alpha=0.3)
+    # 6. Lambda + DR alpha schedule
+    ax_lam = axes[1, 2]
+    ax_lam.plot(ep, history['lambda_p'], 'k-o', ms=3, label='Lambda')
+    ax_lam.set_title('Schedules', fontweight='bold')
+    ax_lam.set_xlabel('Epoch')
+    ax_lam.legend(loc='upper left')
+    ax_lam.grid(alpha=0.3)
+    if 'dr_alpha' in history:
+        ax2 = ax_lam.twinx()
+        ax2.plot(ep, history['dr_alpha'], 'r-s', ms=3, alpha=0.7, label='DR Alpha')
+        ax2.set_ylabel('DR Alpha Boost', color='r')
+        ax2.legend(loc='upper right')
 
     plt.suptitle(
-        f'RetinaSense DANN Training Dashboard',
+        'RetinaSense DANN v3 Training Dashboard',
         fontsize=14, fontweight='bold', y=1.01,
     )
     plt.tight_layout()
@@ -858,32 +1057,32 @@ def collect_logits_labels(loader, model, device):
 
 
 # ================================================================
+# PROGRESSIVE DR ALPHA
+# ================================================================
+def compute_dr_alpha_boost(epoch, total_epochs, start=1.5, end=3.0):
+    """Linearly interpolate DR alpha boost from start to end across epochs."""
+    if total_epochs <= 1:
+        return end
+    progress = epoch / (total_epochs - 1)
+    return start + (end - start) * progress
+
+
+# ================================================================
 # MAIN
 # ================================================================
 def main():
     args = parse_args()
     cfg  = Config()
 
+    # Set seed for reproducibility
+    set_seed(args.seed)
+
     # Override config from CLI
-    cfg.NUM_EPOCHS   = args.epochs
-    cfg.BASE_LR      = args.lr
+    cfg.NUM_EPOCHS    = args.epochs
+    cfg.BASE_LR       = args.lr
     cfg.DOMAIN_WEIGHT = args.domain_weight
     cfg.BATCH_SIZE    = args.batch_size
     cfg.NUM_WORKERS   = args.workers
-
-    # ViT-Large/16 backbone for RETFound
-    if args.backbone == 'retfound':
-        cfg.MODEL_NAME = 'vit_large_patch16_224'
-        cfg.FEAT_DIM   = 1024
-        cfg.LLRD_DECAY = 0.9   # gentler decay for 24 blocks (0.85^25 is too small)
-        # Default to smaller batch size for ViT-Large (~307M params)
-        if args.batch_size == 32:  # only override if user didn't explicitly set
-            cfg.BATCH_SIZE = 16
-        # Warm-start from ViT-Base checkpoint won't work (different dimensions)
-        if not args.no_warmstart:
-            print('  NOTE: --no-warmstart forced (ViT-Base checkpoint incompatible '
-                  'with ViT-Large backbone)')
-            args.no_warmstart = True
 
     # Override output dir if specified
     if args.output_dir:
@@ -892,82 +1091,137 @@ def main():
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
     os.makedirs('configs', exist_ok=True)
 
-    print('=' * 65)
-    print('   RetinaSense DANN — Domain-Adversarial Training Pipeline')
-    print('=' * 65)
+    print('=' * 75)
+    print('   RetinaSense DANN v3 -- Improved Training Pipeline (Target: 90%)')
+    print('=' * 75)
     if torch.cuda.is_available():
-        print(f'  GPU         : {torch.cuda.get_device_name(0)}')
-        print(f'  VRAM        : '
+        print(f'  GPU           : {torch.cuda.get_device_name(0)}')
+        print(f'  VRAM          : '
               f'{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
-    print(f'  Backbone    : {args.backbone}')
-    print(f'  Epochs      : {cfg.NUM_EPOCHS}  (patience={cfg.PATIENCE})')
-    print(f'  Batch       : {cfg.BATCH_SIZE} '
+    print(f'  Epochs        : {cfg.NUM_EPOCHS}  (patience={cfg.PATIENCE})')
+    print(f'  Batch         : {cfg.BATCH_SIZE} '
           f'(eff. {cfg.BATCH_SIZE * cfg.GRADIENT_ACCUMULATION} via grad accum)')
-    print(f'  Base LR     : {cfg.BASE_LR:.1e}')
-    print(f'  LLRD decay  : {cfg.LLRD_DECAY}')
-    print(f'  Domain wt   : {cfg.DOMAIN_WEIGHT}')
-    print(f'  MixUp alpha : {cfg.MIXUP_ALPHA}')
-    print(f'  Focal gamma : {cfg.FOCAL_GAMMA}')
-    print(f'  Warm-start  : {args.warmstart}')
-    print('=' * 65)
+    print(f'  Base LR       : {cfg.BASE_LR:.1e}')
+    print(f'  LLRD decay    : {cfg.LLRD_DECAY}')
+    print(f'  Domain wt     : {cfg.DOMAIN_WEIGHT}')
+    print(f'  Focal gamma   : {cfg.FOCAL_GAMMA}')
+    print(f'  Label smooth  : {args.label_smoothing}')
+    print(f'  Mixup alpha   : {args.mixup_alpha} (prob={args.mixup_prob})')
+    print(f'  DR alpha      : {args.dr_alpha_start} -> {args.dr_alpha_end} (progressive)')
+    print(f'  Hard mining   : top-{args.hard_mining_k} x{args.hard_mining_factor}')
+    print(f'  Scheduler     : CosineWarmRestarts T0={args.cosine_t0} Tmult={args.cosine_tmult}')
+    print(f'  Max lambda    : {args.max_lambda}')
+    print(f'  TTA           : {"Enabled" if args.tta else "Disabled"} ({args.tta_n}-way)')
+    print(f'  Warm-start    : {args.warmstart}')
+    print(f'  Seed          : {args.seed}')
+    print('=' * 75)
 
     # ----------------------------------------------------------
     # 1. Normalisation stats
     # ----------------------------------------------------------
-    print('\n[1/9] Loading normalisation stats...')
+    print('\n[1/10] Loading normalisation stats...')
     NORM_MEAN, NORM_STD = load_norm_stats()
 
     # ----------------------------------------------------------
-    # 2. Load splits
+    # 2. Load splits (prefer expanded, fall back to original)
     # ----------------------------------------------------------
-    print('\n[2/9] Loading data splits...')
-    if not all(os.path.exists(p) for p in [cfg.TRAIN_CSV, cfg.CALIB_CSV, cfg.TEST_CSV]):
+    print('\n[2/10] Loading data splits...')
+
+    # Train
+    if os.path.exists(cfg.TRAIN_CSV):
+        train_df = pd.read_csv(cfg.TRAIN_CSV)
+        print(f'  Train: loaded {cfg.TRAIN_CSV} ({len(train_df)} samples)')
+    elif os.path.exists(cfg.TRAIN_CSV_FALLBACK):
+        train_df = pd.read_csv(cfg.TRAIN_CSV_FALLBACK)
+        print(f'  Train: loaded FALLBACK {cfg.TRAIN_CSV_FALLBACK} ({len(train_df)} samples)')
+    else:
         raise FileNotFoundError(
-            'Split CSVs not found. Run retinasense_v3.py first to generate them.'
+            f'No train CSV found at {cfg.TRAIN_CSV} or {cfg.TRAIN_CSV_FALLBACK}'
         )
 
-    train_df = pd.read_csv(cfg.TRAIN_CSV)
-    calib_df = pd.read_csv(cfg.CALIB_CSV)
-    test_df  = pd.read_csv(cfg.TEST_CSV)
+    # Calib
+    if os.path.exists(cfg.CALIB_CSV):
+        calib_df = pd.read_csv(cfg.CALIB_CSV)
+        print(f'  Calib: loaded {cfg.CALIB_CSV} ({len(calib_df)} samples)')
+    elif os.path.exists(cfg.CALIB_CSV_FALLBACK):
+        calib_df = pd.read_csv(cfg.CALIB_CSV_FALLBACK)
+        print(f'  Calib: loaded FALLBACK {cfg.CALIB_CSV_FALLBACK} ({len(calib_df)} samples)')
+    else:
+        raise FileNotFoundError(
+            f'No calib CSV found at {cfg.CALIB_CSV} or {cfg.CALIB_CSV_FALLBACK}'
+        )
 
-    print(f'  Train : {len(train_df)}')
-    print(f'  Calib : {len(calib_df)}')
-    print(f'  Test  : {len(test_df)}')
+    # Test (always the sealed set)
+    if not os.path.exists(cfg.TEST_CSV):
+        raise FileNotFoundError(f'Test CSV not found: {cfg.TEST_CSV}')
+    test_df = pd.read_csv(cfg.TEST_CSV)
+    print(f'  Test : loaded {cfg.TEST_CSV} ({len(test_df)} samples) [SEALED]')
 
     # ----------------------------------------------------------
-    # 3. Build domain mapping
+    # 3. Build domain mapping (4 domains for expanded dataset)
     # ----------------------------------------------------------
-    print('\n[3/9] Building domain mapping...')
+    print('\n[3/10] Building domain mapping...')
+
+    # Fixed domain mapping: APTOS=0, ODIR=1, REFUGE2=2, MESSIDOR2=3
+    domain_map = {
+        'APTOS':     0,
+        'ODIR':      1,
+        'REFUGE2':   2,
+        'MESSIDOR2': 3,
+    }
+
+    # Include any unexpected sources at the end
     all_sources = sorted(set(
-        train_df['source'].unique().tolist() +
-        calib_df['source'].unique().tolist() +
-        test_df['source'].unique().tolist()
+        train_df['source'].str.upper().unique().tolist() +
+        calib_df['source'].str.upper().unique().tolist() +
+        test_df['source'].str.upper().unique().tolist()
     ))
-    domain_map = {src.upper(): i for i, src in enumerate(all_sources)}
+    for src in all_sources:
+        if src not in domain_map:
+            domain_map[src] = len(domain_map)
+            print(f'  WARNING: unexpected source "{src}" assigned domain {domain_map[src]}')
+
     num_domains = len(domain_map)
 
     print(f'  Domains ({num_domains}):')
-    for src, idx in domain_map.items():
+    for src, idx in sorted(domain_map.items(), key=lambda x: x[1]):
         train_cnt = (train_df['source'].str.upper() == src).sum()
-        print(f'    {idx}: {src:10s} ({train_cnt} train samples)')
-
-    # Domain distribution in train
-    train_domain_counts = train_df['source'].str.upper().map(domain_map).value_counts()
-    print(f'  Train domain distribution: {dict(train_domain_counts)}')
+        calib_cnt = (calib_df['source'].str.upper() == src).sum()
+        test_cnt  = (test_df['source'].str.upper() == src).sum()
+        print(f'    {idx}: {src:12s}  train={train_cnt:5d}  '
+              f'calib={calib_cnt:4d}  test={test_cnt:4d}')
 
     # ----------------------------------------------------------
-    # 4. Datasets and loaders
+    # 4. Class distribution analysis
     # ----------------------------------------------------------
-    print('\n[4/9] Building datasets and loaders...')
+    print('\n[4/10] Class distribution analysis...')
+    train_labels = train_df['disease_label'].values
+    class_counts = np.bincount(train_labels, minlength=5)
+    total_train  = len(train_labels)
+
+    for ci, cn in enumerate(cfg.CLASS_NAMES):
+        pct = 100.0 * class_counts[ci] / total_train
+        print(f'  {cn:15s}: {class_counts[ci]:5d} ({pct:5.1f}%)')
+
+    # ----------------------------------------------------------
+    # 5. Datasets and loaders
+    # ----------------------------------------------------------
+    print('\n[5/10] Building datasets and loaders...')
 
     train_transform = make_transforms('train', NORM_MEAN, NORM_STD)
     val_transform   = make_transforms('val',   NORM_MEAN, NORM_STD)
 
-    train_ds = RetinalDANNDataset(train_df, train_transform, domain_map)
-    calib_ds = RetinalDANNDataset(calib_df, val_transform,   domain_map)
-    test_ds  = RetinalDANNDataset(test_df,  val_transform,   domain_map)
+    train_ds = RetinalDANNv3Dataset(train_df, train_transform, domain_map)
+    calib_ds = RetinalDANNv3Dataset(calib_df, val_transform,   domain_map)
+    test_ds  = RetinalDANNv3Dataset(test_df,  val_transform,   domain_map)
 
-    sampler = make_weighted_sampler(train_df, cfg.NUM_DISEASE_CLASSES)
+    # Hard-example mining sampler with class balancing
+    sampler = HardExampleMiningWeightedSampler(
+        labels=train_df['disease_label'].values,
+        n_classes=cfg.NUM_DISEASE_CLASSES,
+        hard_k=args.hard_mining_k,
+        hard_factor=args.hard_mining_factor,
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.BATCH_SIZE,
@@ -991,9 +1245,9 @@ def main():
     print(f'  Test  : {len(test_ds):5d}  ({len(test_loader):3d} batches)')
 
     # ----------------------------------------------------------
-    # 5. Model
+    # 6. Model
     # ----------------------------------------------------------
-    print('\n[5/9] Building DANN model...')
+    print('\n[6/10] Building DANN v3 model...')
 
     model = DANNMultiTaskViT(
         n_disease=cfg.NUM_DISEASE_CLASSES,
@@ -1003,17 +1257,10 @@ def main():
         backbone_name=cfg.MODEL_NAME,
     ).to(cfg.DEVICE)
 
-    # RETFound backbone (if requested)
-    if args.backbone == 'retfound':
-        if args.weights is None:
-            raise ValueError(
-                '--weights is required when using --backbone retfound'
-            )
-        load_retfound_backbone(model, args.weights, cfg.DEVICE)
-
     # Warm-start from existing checkpoint
     if not args.no_warmstart:
-        load_warmstart_weights(model, args.warmstart, cfg.DEVICE)
+        load_warmstart_weights(model, args.warmstart, cfg.DEVICE,
+                               num_domains_new=num_domains)
 
     total_params = sum(p.numel() for p in model.parameters())
     domain_params = sum(p.numel() for p in model.domain_head.parameters())
@@ -1021,51 +1268,59 @@ def main():
     print(f'  Domain head   : {domain_params:,}')
 
     # ----------------------------------------------------------
-    # 6. Loss functions and optimizer
+    # 7. Loss functions and optimizer
     # ----------------------------------------------------------
-    print('\n[6/9] Setting up losses and optimizer...')
+    print('\n[7/10] Setting up losses and optimizer...')
 
-    # Focal loss with class weights
+    # Focal loss with class weights (DR alpha will be updated each epoch)
     cw = compute_class_weight(
         'balanced',
         classes=np.arange(cfg.NUM_DISEASE_CLASSES),
         y=train_df['disease_label'].values,
     )
-    alpha = torch.tensor(cw, dtype=torch.float32).to(cfg.DEVICE)
-    alpha = alpha / alpha.sum() * cfg.NUM_DISEASE_CLASSES
-    # Boost DR alpha if requested (class index 1 = DR)
-    if args.dr_alpha_boost != 1.0:
-        alpha[1] *= args.dr_alpha_boost
-        print(f'  DR alpha boosted by {args.dr_alpha_boost}x')
-    print(f'  Focal alpha: {[f"{a:.2f}" for a in alpha.tolist()]}')
+    base_alpha = torch.tensor(cw, dtype=torch.float32).to(cfg.DEVICE)
+    base_alpha = base_alpha / base_alpha.sum() * cfg.NUM_DISEASE_CLASSES
+    print(f'  Base focal alpha: {[f"{a:.2f}" for a in base_alpha.tolist()]}')
 
-    criterion_d = FocalLoss(alpha=alpha, gamma=cfg.FOCAL_GAMMA)
-    criterion_s = nn.CrossEntropyLoss(ignore_index=-1)
+    # Initial DR boost (will be updated progressively)
+    initial_dr_boost = args.dr_alpha_start
+    alpha_epoch0 = base_alpha.clone()
+    alpha_epoch0[1] *= initial_dr_boost
+    print(f'  Initial DR alpha boost: {initial_dr_boost:.1f}x -> '
+          f'alpha[DR]={alpha_epoch0[1]:.2f}')
+
+    criterion_d = FocalLoss(
+        alpha=alpha_epoch0, gamma=cfg.FOCAL_GAMMA,
+        label_smoothing=args.label_smoothing,
+    )
+    criterion_s = nn.CrossEntropyLoss(
+        ignore_index=-1,
+        label_smoothing=args.label_smoothing,
+    )
     criterion_dom = nn.CrossEntropyLoss()
+
+    # Per-sample loss (no reduction) for hard-example mining
+    criterion_per_sample = nn.CrossEntropyLoss(reduction='none')
 
     optimizer = get_optimizer_with_llrd(
         model, base_lr=cfg.BASE_LR, decay_factor=cfg.LLRD_DECAY,
         weight_decay=cfg.WEIGHT_DECAY,
     )
 
-    # OneCycleLR scheduler
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    # CosineAnnealingWarmRestarts scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        max_lr=[pg['lr'] for pg in optimizer.param_groups],
-        steps_per_epoch=len(train_loader),
-        epochs=cfg.NUM_EPOCHS,
-        pct_start=0.1,
-        anneal_strategy='cos',
-        div_factor=10.0,
-        final_div_factor=100.0,
+        T_0=args.cosine_t0,
+        T_mult=args.cosine_tmult,
+        eta_min=cfg.BASE_LR * 0.01,  # min LR = 1% of base
     )
 
     scaler = GradScaler()
 
     # ----------------------------------------------------------
-    # 7. Training loop
+    # 8. Training loop
     # ----------------------------------------------------------
-    print('\n[7/9] Training with domain adversarial objective...')
+    print('\n[8/10] Training with DANN v3 improvements...')
 
     CHECKPOINT = os.path.join(cfg.OUTPUT_DIR, 'best_model.pth')
 
@@ -1074,6 +1329,7 @@ def main():
         'train_acc', 'val_acc',
         'train_domain_acc', 'val_domain_acc',
         'macro_f1', 'weighted_f1', 'lr', 'lambda_p',
+        'dr_alpha', 'hard_samples', 'dr_as_normal_errors',
     ] + [f'f1_{cn}' for cn in cfg.CLASS_NAMES]
 
     history = {k: [] for k in history_keys}
@@ -1083,17 +1339,26 @@ def main():
     patience_ctr = 0
     t_start      = time.time()
 
-    print('=' * 75)
-    print(f'{"Ep":>3} | {"Time":>4} | {"LR":>8} | {"Lam":>5} | '
+    print('=' * 85)
+    print(f'{"Ep":>3} | {"Time":>4} | {"LR":>8} | {"Lam":>5} {"DRa":>4} | '
           f'{"TrL":>6} {"TrA":>5} | {"VL":>6} {"VA":>5} | '
-          f'{"mF1":>6} {"wF1":>6} | {"DomA":>5} |')
-    print('-' * 75)
+          f'{"mF1":>6} {"wF1":>6} | {"DomA":>5} | {"Hard":>5} |')
+    print('-' * 85)
 
     for epoch in range(cfg.NUM_EPOCHS):
         t0 = time.time()
 
-        # Compute lambda for this epoch
-        lam_p = ganin_lambda(epoch, cfg.NUM_EPOCHS)
+        # --- Progressive schedules ---
+        lam_p    = ganin_lambda(epoch, cfg.NUM_EPOCHS, max_lambda=args.max_lambda)
+        dr_boost = compute_dr_alpha_boost(
+            epoch, cfg.NUM_EPOCHS,
+            start=args.dr_alpha_start, end=args.dr_alpha_end,
+        )
+
+        # Update focal loss alpha with progressive DR boost
+        alpha_this_epoch = base_alpha.clone()
+        alpha_this_epoch[1] *= dr_boost
+        criterion_d.alpha.copy_(alpha_this_epoch)
 
         # ---- TRAIN ----
         model.train()
@@ -1103,6 +1368,12 @@ def main():
         dom_correct  = 0
         total        = 0
 
+        # Accumulators for hard-example mining
+        epoch_indices = []
+        epoch_losses  = []
+        epoch_preds   = []
+        epoch_targets = []
+
         optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(
@@ -1111,36 +1382,41 @@ def main():
             leave=False,
         )
 
-        for step, (imgs, d_lbl, s_lbl, dom_lbl) in enumerate(pbar):
-            imgs    = imgs.to(cfg.DEVICE, non_blocking=True)
-            d_lbl   = d_lbl.to(cfg.DEVICE, non_blocking=True)
-            s_lbl   = s_lbl.to(cfg.DEVICE, non_blocking=True)
-            dom_lbl = dom_lbl.to(cfg.DEVICE, non_blocking=True)
+        for step, (imgs, d_lbl, s_lbl, dom_lbl, sample_idx) in enumerate(pbar):
+            imgs       = imgs.to(cfg.DEVICE, non_blocking=True)
+            d_lbl      = d_lbl.to(cfg.DEVICE, non_blocking=True)
+            s_lbl      = s_lbl.to(cfg.DEVICE, non_blocking=True)
+            dom_lbl    = dom_lbl.to(cfg.DEVICE, non_blocking=True)
+            sample_idx = sample_idx.to(cfg.DEVICE, non_blocking=True)
 
-            # MixUp for disease labels only (NOT domain labels)
-            mixed_imgs, y_a, y_b, lam, mix_idx = mixup_data(
-                imgs, d_lbl, alpha=cfg.MIXUP_ALPHA,
-            )
+            # Decide whether to apply mixup this batch
+            apply_mixup = (random.random() < args.mixup_prob) and (args.mixup_alpha > 0)
+
+            if apply_mixup:
+                mixed_imgs, y_a, y_b, lam, mix_idx = mixup_data(
+                    imgs, d_lbl, alpha=args.mixup_alpha,
+                )
+            else:
+                mixed_imgs = imgs
+                y_a = d_lbl
+                y_b = d_lbl
+                lam = 1.0
 
             with autocast('cuda'):
-                # Forward with domain adversarial
-                # Use ORIGINAL images for domain head (not mixed)
-                # but mixed images go through backbone for disease head
+                # Forward pass (mixed images through backbone)
                 d_out, s_out, dom_out_mixed = model(mixed_imgs, alpha=lam_p)
 
-                # Also forward original images for clean domain prediction
-                with torch.no_grad():
-                    _, _, dom_out_clean = model(imgs, alpha=lam_p)
+                # Disease loss (mixed if mixup applied)
+                if apply_mixup:
+                    loss_d = (lam * criterion_d(d_out, y_a) +
+                              (1 - lam) * criterion_d(d_out, y_b))
+                else:
+                    loss_d = criterion_d(d_out, y_a)
 
-                # Disease loss (mixed focal loss)
-                loss_d = (lam * criterion_d(d_out, y_a) +
-                          (1 - lam) * criterion_d(d_out, y_b))
-
-                # Severity loss (unmixed)
+                # Severity loss (unmixed, on original labels)
                 loss_s = criterion_s(s_out, s_lbl)
 
-                # Domain loss on ORIGINAL (unmixed) images
-                # Re-forward original images through domain path
+                # Domain loss on ORIGINAL (unmixed) images for clean domain targets
                 f_orig = model.backbone(imgs)
                 f_orig = model.drop(f_orig)
                 dom_out_orig = model.domain_head(model.grl(f_orig, lam_p))
@@ -1163,7 +1439,6 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             run_loss     += loss.item() * cfg.GRADIENT_ACCUMULATION
@@ -1176,10 +1451,18 @@ def main():
                 dom_correct += (dom_preds == dom_lbl).sum().item()
                 total       += d_lbl.size(0)
 
+                # Per-sample losses for hard-example mining (use original labels)
+                per_sample_loss = criterion_per_sample(d_out.float(), d_lbl)
+                epoch_indices.append(sample_idx.cpu())
+                epoch_losses.append(per_sample_loss.cpu())
+                epoch_preds.append(preds.cpu())
+                epoch_targets.append(d_lbl.cpu())
+
             pbar.set_postfix(
                 loss=f'{loss.item() * cfg.GRADIENT_ACCUMULATION:.3f}',
                 acc=f'{100 * correct / total:.1f}%',
                 dom=f'{100 * dom_correct / total:.1f}%',
+                dr_a=f'{dr_boost:.1f}x',
             )
 
         # Flush remaining gradients
@@ -1188,8 +1471,22 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+
+        # Step scheduler (per-epoch for CosineWarmRestarts)
+        scheduler.step(epoch)
+
+        # --- Update hard-example mining sampler ---
+        all_epoch_indices = torch.cat(epoch_indices)
+        all_epoch_losses  = torch.cat(epoch_losses)
+        all_epoch_preds   = torch.cat(epoch_preds)
+        all_epoch_targets = torch.cat(epoch_targets)
+
+        sampler.update_losses(
+            all_epoch_indices, all_epoch_losses,
+            preds=all_epoch_preds, targets=all_epoch_targets,
+        )
+        mining_stats = sampler.get_stats()
 
         train_loss     = run_loss / max(len(train_loader), 1)
         avg_dom_loss   = run_dom_loss / max(len(train_loader), 1)
@@ -1227,6 +1524,9 @@ def main():
         history['weighted_f1'].append(float(wf1))
         history['lr'].append(float(lr_now))
         history['lambda_p'].append(float(lam_p))
+        history['dr_alpha'].append(float(dr_boost))
+        history['hard_samples'].append(mining_stats['hard_samples_tracked'])
+        history['dr_as_normal_errors'].append(mining_stats['dr_as_normal'])
         for ci, cn in enumerate(cfg.CLASS_NAMES):
             history[f'f1_{cn}'].append(float(per_f1[ci]))
 
@@ -1246,6 +1546,7 @@ def main():
                 'num_domains':      num_domains,
                 'history':          history,
                 'args':             vars(args),
+                'dr_alpha_boost':   dr_boost,
             }, CHECKPOINT)
             tag = ' *BEST*'
         else:
@@ -1253,10 +1554,12 @@ def main():
 
         # Print epoch summary
         print(
-            f'{epoch+1:3d} | {elapsed:4.0f}s | {lr_now:.2e} | {lam_p:.3f} | '
+            f'{epoch+1:3d} | {elapsed:4.0f}s | {lr_now:.2e} | '
+            f'{lam_p:.3f} {dr_boost:.1f} | '
             f'{train_loss:6.3f} {train_acc:5.1f} | '
             f'{val_loss:6.3f} {val_acc:5.1f} | '
-            f'{mf1:.4f} {wf1:.4f} | {val_dom_acc:5.1f} |{tag}'
+            f'{mf1:.4f} {wf1:.4f} | {val_dom_acc:5.1f} | '
+            f'{mining_stats["dr_as_normal"]:5d} |{tag}'
         )
         cls_str = ' | '.join(
             f'{cn[:3]}:{per_f1[ci]:.2f}' for ci, cn in enumerate(cfg.CLASS_NAMES)
@@ -1277,16 +1580,19 @@ def main():
         serializable = {}
         for k, v in history.items():
             if isinstance(v, list):
-                serializable[k] = [float(x) if isinstance(x, (float, np.floating)) else x for x in v]
+                serializable[k] = [
+                    float(x) if isinstance(x, (float, np.floating)) else x
+                    for x in v
+                ]
             else:
                 serializable[k] = v
         json.dump(serializable, f, indent=2)
     print(f'  History saved to {history_path}')
 
     # ----------------------------------------------------------
-    # 8. Temperature scaling on calibration set
+    # 9. Temperature scaling on calibration set
     # ----------------------------------------------------------
-    print('\n[8/9] Temperature scaling on calibration set...')
+    print('\n[9/10] Temperature scaling on calibration set...')
 
     # Reload best checkpoint
     ckpt = torch.load(CHECKPOINT, map_location=cfg.DEVICE, weights_only=False)
@@ -1314,6 +1620,7 @@ def main():
         'temperature': T_opt,
         'ece_before': ece_before,
         'ece_after': ece_after,
+        'model_version': 'dann_v3',
     }
     temp_path = 'configs/temperature.json'
     with open(temp_path, 'w') as f:
@@ -1321,9 +1628,9 @@ def main():
     print(f'  Saved -> {temp_path}')
 
     # ----------------------------------------------------------
-    # 9. Threshold optimisation
+    # 10. Threshold optimisation + final evaluation
     # ----------------------------------------------------------
-    print('\n[9/9] Per-class threshold optimisation on calibration set...')
+    print('\n[10/10] Per-class threshold optimisation and final evaluation...')
 
     calib_thresholds = optimise_thresholds(
         probs_after, calib_labels.numpy(),
@@ -1333,6 +1640,7 @@ def main():
     thresh_data = {
         'thresholds': calib_thresholds,
         'class_names': cfg.CLASS_NAMES,
+        'model_version': 'dann_v3',
     }
     thresh_path = 'configs/thresholds.json'
     with open(thresh_path, 'w') as f:
@@ -1342,11 +1650,12 @@ def main():
     # ----------------------------------------------------------
     # Final evaluation on test set
     # ----------------------------------------------------------
-    print('\n' + '=' * 65)
+    print('\n' + '=' * 75)
     print('         FINAL EVALUATION -- TEST SET')
-    print('=' * 65)
+    print('=' * 75)
     print('  (Test set was never seen during training or threshold tuning)')
 
+    # Standard evaluation
     test_logits, test_labels = collect_logits_labels(
         test_loader, model, cfg.DEVICE,
     )
@@ -1397,6 +1706,37 @@ def main():
         'With per-class thresholds',
     )
 
+    # TTA evaluation (if enabled)
+    metrics_tta = None
+    if args.tta:
+        print('\n' + '-' * 65)
+        print('  Test-Time Augmentation (TTA)')
+        print('-' * 65)
+        tta_probs, tta_targets = evaluate_with_tta(
+            test_df, domain_map, model, cfg.DEVICE,
+            NORM_MEAN, NORM_STD,
+            batch_size=cfg.BATCH_SIZE,
+            num_workers=cfg.NUM_WORKERS,
+            n_augs=args.tta_n,
+            desc='TTA Test',
+        )
+
+        # Apply temperature scaling to TTA probs
+        # (TTA already produces averaged softmax probs, so T-scaling is
+        # approximate; but we apply it for consistency)
+        tta_preds_raw = tta_probs.argmax(axis=1)
+        tta_preds_thr = apply_thresholds(tta_probs, calib_thresholds)
+
+        print('\n  TTA Results:')
+        metrics_tta_raw = print_metrics(
+            tta_preds_raw, tta_targets, tta_probs,
+            f'TTA ({args.tta_n}-way) raw argmax',
+        )
+        metrics_tta = print_metrics(
+            tta_preds_thr, tta_targets, tta_probs,
+            f'TTA ({args.tta_n}-way) + thresholds',
+        )
+
     # Domain accuracy on test set
     test_dom_acc = evaluate_domain(test_loader, model, cfg.DEVICE, alpha=1.0)
     print(f'  Test domain accuracy: {test_dom_acc:.1f}% '
@@ -1406,15 +1746,38 @@ def main():
     final_metrics = {
         'raw': metrics_raw,
         'thresholded': metrics_thr,
+        'tta': metrics_tta,
         'temperature': T_opt,
         'thresholds': calib_thresholds,
         'domain_accuracy_test': test_dom_acc,
         'num_domains': num_domains,
         'domain_map': domain_map,
+        'improvements': {
+            'expanded_dataset': True,
+            'hard_example_mining': True,
+            'progressive_dr_alpha': f'{args.dr_alpha_start} -> {args.dr_alpha_end}',
+            'label_smoothing': args.label_smoothing,
+            'mixup_alpha': args.mixup_alpha,
+            'cosine_warm_restarts': f'T0={args.cosine_t0}, Tmult={args.cosine_tmult}',
+            'tta_enabled': args.tta,
+        },
     }
     metrics_path = os.path.join(cfg.OUTPUT_DIR, 'final_metrics.json')
     with open(metrics_path, 'w') as f:
         json.dump(final_metrics, f, indent=2)
+
+    # Save confusion matrix
+    cm = confusion_matrix(test_labels_np, test_preds_thr)
+    fig_cm, ax_cm = plt.subplots(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=cfg.CLASS_NAMES, yticklabels=cfg.CLASS_NAMES,
+                ax=ax_cm)
+    ax_cm.set_xlabel('Predicted')
+    ax_cm.set_ylabel('True')
+    ax_cm.set_title('DANN v3 - Test Set Confusion Matrix')
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.OUTPUT_DIR, 'confusion_matrix.png'), dpi=150)
+    plt.close()
 
     # ----------------------------------------------------------
     # Dashboard plot
@@ -1425,9 +1788,9 @@ def main():
     # ----------------------------------------------------------
     # Summary
     # ----------------------------------------------------------
-    print('\n' + '=' * 65)
-    print('         RETINASENSE DANN -- FINAL SUMMARY')
-    print('=' * 65)
+    print('\n' + '=' * 75)
+    print('         RETINASENSE DANN v3 -- FINAL SUMMARY')
+    print('=' * 75)
     print(f'  Training epochs     : {len(history["train_loss"])}')
     print(f'  Best calib macro-F1 : {best_f1:.4f}')
     print(f'  Temperature T       : {T_opt:.4f}')
@@ -1435,12 +1798,33 @@ def main():
     print(f'  Test domain acc     : {test_dom_acc:.1f}% '
           f'(chance={100.0/num_domains:.1f}%)')
     print()
-    print('  TEST SET RESULTS (with thresholds)')
+    print('  v3 IMPROVEMENTS:')
+    print(f'    Expanded dataset  : {len(train_df)} train samples '
+          f'(+MESSIDOR2, 4 domains)')
+    print(f'    Hard mining       : top-{args.hard_mining_k} x{args.hard_mining_factor}')
+    print(f'    Progressive DR    : alpha {args.dr_alpha_start} -> {args.dr_alpha_end}')
+    print(f'    Label smoothing   : {args.label_smoothing}')
+    print(f'    Mixup             : alpha={args.mixup_alpha}, prob={args.mixup_prob}')
+    print(f'    Scheduler         : CosineWarmRestarts '
+          f'(T0={args.cosine_t0}, Tmult={args.cosine_tmult})')
+    print(f'    TTA               : {"Enabled" if args.tta else "Disabled"}')
+    print()
+    print('  TEST SET RESULTS (with thresholds):')
     print(f'    Accuracy   : {metrics_thr["accuracy"]:.2f}%')
     print(f'    Macro F1   : {metrics_thr["macro_f1"]:.4f}')
     print(f'    Weighted F1: {metrics_thr["weighted_f1"]:.4f}')
     print(f'    Macro AUC  : {metrics_thr["macro_auc"]:.4f}')
     print(f'    ECE        : {metrics_thr["ece"]:.4f}')
+
+    if metrics_tta:
+        print()
+        print(f'  TEST SET RESULTS (TTA + thresholds):')
+        print(f'    Accuracy   : {metrics_tta["accuracy"]:.2f}%')
+        print(f'    Macro F1   : {metrics_tta["macro_f1"]:.4f}')
+        print(f'    Weighted F1: {metrics_tta["weighted_f1"]:.4f}')
+        print(f'    Macro AUC  : {metrics_tta["macro_auc"]:.4f}')
+        print(f'    ECE        : {metrics_tta["ece"]:.4f}')
+
     print()
     print('  Per-class F1 (test, thresholded):')
     for i, cn in enumerate(cfg.CLASS_NAMES):
@@ -1451,12 +1835,13 @@ def main():
     print(f'  Training time: {total_time / 60:.1f} minutes')
     print()
     print(f'  Outputs saved to {cfg.OUTPUT_DIR}/')
-    for fname in ['best_model.pth', 'history.json', 'dashboard.png']:
+    for fname in ['best_model.pth', 'history.json', 'dashboard.png',
+                   'confusion_matrix.png', 'final_metrics.json']:
         print(f'    -- {fname}')
     print(f'  Configs saved to configs/')
     for fname in ['temperature.json', 'thresholds.json']:
         print(f'    -- {fname}')
-    print('=' * 65)
+    print('=' * 75)
 
 
 if __name__ == '__main__':

@@ -61,14 +61,24 @@ torch.set_num_threads(4)
 # ================================================================
 # CONFIGURATION
 # ================================================================
-BASE_DIR    = '/teamspace/studios/this_studio'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR  = os.path.join(BASE_DIR, 'outputs_v3')
 UNCERT_DIR  = os.path.join(OUTPUT_DIR, 'uncertainty')
 os.makedirs(UNCERT_DIR, exist_ok=True)
 
-MODEL_PATH       = os.path.join(OUTPUT_DIR, 'best_model.pth')
-TEMPERATURE_PATH = os.path.join(OUTPUT_DIR, 'temperature.json')
-NORM_STATS_PATH  = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
+MODEL_PATH = next(
+    (p for p in [
+        os.path.join(OUTPUT_DIR, 'dann_v3', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'dann_v2', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'dann', 'best_model.pth'),
+        os.path.join(OUTPUT_DIR, 'best_model.pth'),
+    ] if os.path.exists(p)),
+    os.path.join(OUTPUT_DIR, 'best_model.pth')
+)
+TEMPERATURE_PATH = os.path.join(BASE_DIR, 'configs', 'temperature.json')
+NORM_STATS_PATH  = os.path.join(BASE_DIR, 'configs', 'fundus_norm_stats_unified.json')
+if not os.path.exists(NORM_STATS_PATH):
+    NORM_STATS_PATH = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
 TEST_CSV         = os.path.join(BASE_DIR, 'data', 'test_split.csv')
 
 CLASS_NAMES = ['Normal', 'Diabetes/DR', 'Glaucoma', 'Cataract', 'AMD']
@@ -158,7 +168,10 @@ class MultiTaskViT(nn.Module):
 print('\nLoading model...')
 model = MultiTaskViT().to(DEVICE)
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-model.load_state_dict(ckpt['model_state_dict'])
+state_dict = ckpt['model_state_dict']
+filtered = {k: v for k, v in state_dict.items()
+            if not k.startswith('domain_head') and not k.startswith('grl')}
+model.load_state_dict(filtered, strict=False)
 print(f'  Loaded: {MODEL_PATH}')
 print(f'  Checkpoint epoch: {ckpt.get("epoch", "?") + 1}  '
       f'val_acc={ckpt.get("val_acc", 0):.2f}%')
@@ -260,10 +273,13 @@ class TestDataset(Dataset):
         dataset  = str(row.get('source', 'auto'))
         label    = int(row['disease_label'])
 
-        # Try loading from cache first
+        # Try loading from cache first (prefer unified cache)
         cache_path = str(row.get('cache_path', ''))
         if cache_path and cache_path != 'nan':
             cache_abs = resolve_path(cache_path)
+            unified_abs = cache_abs.replace('preprocessed_cache_v3', 'preprocessed_cache_unified')
+            if os.path.exists(unified_abs):
+                cache_abs = unified_abs
             if os.path.exists(cache_abs):
                 try:
                     img_np = np.load(cache_abs)

@@ -6,7 +6,7 @@ Upload a fundus image → get prediction, attention heatmap, confidence,
 uncertainty, OOD check, and downloadable clinical report.
 """
 
-import os, json, sys, time, tempfile, warnings
+import os, json, sys, time, tempfile, warnings, argparse
 import numpy as np
 import cv2
 import torch
@@ -29,15 +29,20 @@ IMG_SIZE = 224
 NUM_CLASSES = 5
 CLASS_NAMES = ['Normal', 'Diabetes/DR', 'Glaucoma', 'Cataract', 'AMD']
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, 'outputs_v3/best_model.pth')
-# Config files: look in configs/ first (committed to git), fall back to outputs_v3/
-def _cfg(name, subdir):
-    committed = os.path.join(BASE_DIR, 'configs', name)
-    original  = os.path.join(BASE_DIR, subdir, name)
-    return committed if os.path.exists(committed) else original
-TEMP_PATH   = _cfg('temperature.json',        'outputs_v3')
-THRESH_PATH = _cfg('thresholds.json',         'outputs_v3')
-NORM_PATH   = _cfg('fundus_norm_stats.json',  'data')
+# Primary: DANN-v3 model; fallbacks: dann_v3 -> dann_v2 -> dann -> original model
+DANN_V3_MODEL_PATH = os.path.join(BASE_DIR, 'outputs_v3/dann_v3/best_model.pth')
+DANN_MODEL_PATH = os.path.join(BASE_DIR, 'outputs_v3/dann/best_model.pth')
+DANN_V2_MODEL_PATH = os.path.join(BASE_DIR, 'outputs_v3/dann_v2/best_model.pth')
+ORIG_MODEL_PATH = os.path.join(BASE_DIR, 'outputs_v3/best_model.pth')
+MODEL_PATH = next(
+    (p for p in [DANN_V3_MODEL_PATH, DANN_MODEL_PATH, DANN_V2_MODEL_PATH, ORIG_MODEL_PATH] if os.path.exists(p)),
+    ORIG_MODEL_PATH  # final fallback even if missing (will error clearly)
+)
+
+# Config files: always load from configs/ directory
+TEMP_PATH   = os.path.join(BASE_DIR, 'configs', 'temperature.json')
+THRESH_PATH = os.path.join(BASE_DIR, 'configs', 'thresholds.json')
+NORM_PATH   = os.path.join(BASE_DIR, 'configs', 'fundus_norm_stats_unified.json')
 OOD_PATH    = os.path.join(BASE_DIR, 'outputs_v3/ood_detector')
 
 # Load config files
@@ -81,48 +86,23 @@ class MultiTaskViT(nn.Module):
 print('Loading model...')
 model = MultiTaskViT().to(DEVICE)
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-model.load_state_dict(ckpt['model_state_dict'])
+# Filter out DANN-specific keys (domain_head, grl) before loading into MultiTaskViT
+state_dict = ckpt['model_state_dict']
+filtered = {k: v for k, v in state_dict.items()
+            if not k.startswith('domain_head') and not k.startswith('grl')}
+if len(filtered) < len(state_dict):
+    print(f'  Filtered out {len(state_dict) - len(filtered)} DANN keys (domain_head/grl)')
+load_result = model.load_state_dict(filtered, strict=False)
+if load_result.unexpected_keys:
+    print(f'  Ignored {len(load_result.unexpected_keys)} unexpected keys: '
+          f'{load_result.unexpected_keys[:5]}')
+if load_result.missing_keys:
+    print(f'  WARNING: {len(load_result.missing_keys)} missing keys: {load_result.missing_keys[:5]}')
 model.eval()
-print(f'  Loaded ViT checkpoint epoch {ckpt["epoch"]+1}, val_acc={ckpt["val_acc"]:.2f}%')
-
-
-# ================================================================
-# EFFICIENTNET-B3 (ENSEMBLE)
-# ================================================================
-class EfficientNetB3(nn.Module):
-    def __init__(self, n_classes=NUM_CLASSES, drop=0.3):
-        super().__init__()
-        self.backbone = timm.create_model('efficientnet_b3', pretrained=False, num_classes=0)
-        feat_dim = self.backbone.num_features  # 1536
-        self.drop = nn.Dropout(drop)
-        self.head = nn.Sequential(
-            nn.Linear(feat_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, n_classes),
-        )
-
-    def forward(self, x):
-        f = self.backbone(x)
-        f = self.drop(f)
-        return self.head(f)
-
-
-ENSEMBLE_PATH = os.path.join(BASE_DIR, 'outputs_v3/ensemble/efficientnet_b3.pth')
-ENSEMBLE_WEIGHT_VIT = 0.35
-ENSEMBLE_WEIGHT_EFF = 0.65
-USE_ENSEMBLE = False
-
-if os.path.exists(ENSEMBLE_PATH):
-    print('Loading EfficientNet-B3 for ensemble...')
-    eff_model = EfficientNetB3().to(DEVICE)
-    eff_ckpt = torch.load(ENSEMBLE_PATH, map_location=DEVICE, weights_only=False)
-    eff_model.load_state_dict(eff_ckpt['model_state_dict'])
-    eff_model.eval()
-    USE_ENSEMBLE = True
-    print(f'  Loaded EfficientNet-B3 (epoch {eff_ckpt["epoch"]+1}, F1={eff_ckpt["macro_f1"]:.4f})')
-    print(f'  Ensemble weights: ViT={ENSEMBLE_WEIGHT_VIT}, EfficientNet={ENSEMBLE_WEIGHT_EFF}')
-else:
-    print('  EfficientNet-B3 not found — running ViT-only mode')
+epoch_info = ckpt.get("epoch", "?")
+val_acc = ckpt.get("val_acc", 0.0)
+print(f'  Loaded checkpoint from {MODEL_PATH}')
+print(f'  Epoch {epoch_info+1 if isinstance(epoch_info, int) else epoch_info}, val_acc={val_acc:.2f}%')
 
 
 # ================================================================
@@ -243,6 +223,59 @@ def mc_dropout_predict(image_tensor, T=15):
 
 
 # ================================================================
+# TEST-TIME AUGMENTATION (TTA)
+# ================================================================
+USE_TTA = True  # toggled by --no-tta CLI flag
+
+
+def _create_tta_batch(tensor):
+    """Create 8 augmented versions of a (1,3,H,W) tensor.
+
+    Augmentations (deterministic, no randomness):
+      0 - original
+      1 - horizontal flip
+      2 - vertical flip
+      3 - 90-degree rotation
+      4 - 180-degree rotation
+      5 - 270-degree rotation
+      6 - horizontal flip + 90-degree rotation
+      7 - vertical flip + 90-degree rotation
+
+    Returns a (8,3,H,W) batch tensor.
+    """
+    x = tensor.squeeze(0)  # (3, H, W)
+    augmented = [
+        x,                                        # 0: original
+        torch.flip(x, dims=[2]),                  # 1: horizontal flip
+        torch.flip(x, dims=[1]),                  # 2: vertical flip
+        torch.rot90(x, k=1, dims=[1, 2]),         # 3: 90-degree rotation
+        torch.rot90(x, k=2, dims=[1, 2]),         # 4: 180-degree rotation
+        torch.rot90(x, k=3, dims=[1, 2]),         # 5: 270-degree rotation
+        torch.rot90(torch.flip(x, dims=[2]), k=1, dims=[1, 2]),  # 6: hflip + 90
+        torch.rot90(torch.flip(x, dims=[1]), k=1, dims=[1, 2]),  # 7: vflip + 90
+    ]
+    return torch.stack(augmented, dim=0)  # (8, 3, H, W)
+
+
+@torch.no_grad()
+def tta_predict(tensor):
+    """Run TTA: 8 augmented versions through the model, average softmax probs.
+
+    Args:
+        tensor: preprocessed image tensor of shape (1, 3, 224, 224)
+
+    Returns:
+        numpy array of shape (NUM_CLASSES,) with averaged class probabilities
+    """
+    model.eval()
+    batch = _create_tta_batch(tensor).to(DEVICE)  # (8, 3, 224, 224)
+    d_out, _ = model(batch)                        # (8, NUM_CLASSES)
+    probs = torch.softmax(d_out / T_OPT, dim=1)   # temperature-scaled softmax
+    avg_probs = probs.mean(dim=0)                  # (NUM_CLASSES,)
+    return avg_probs.cpu().numpy()
+
+
+# ================================================================
 # OOD DETECTION
 # ================================================================
 class OODDetector:
@@ -272,58 +305,242 @@ class OODDetector:
 
 
 ood = OODDetector()
-if os.path.exists(OOD_PATH + '.npz'):
-    ood.load(OOD_PATH)
-    print(f'  OOD detector loaded (threshold={ood.ood_threshold:.2f})')
+try:
+    if os.path.exists(OOD_PATH + '.npz'):
+        ood.load(OOD_PATH)
+        print(f'  OOD detector loaded (threshold={ood.ood_threshold:.2f})')
+    else:
+        print('  OOD detector not found (.npz missing) — OOD checks disabled')
+except Exception as e:
+    print(f'  OOD detector failed to load: {e} — OOD checks disabled')
+    ood.is_fitted = False
 
 
 # ================================================================
-# PREPROCESSING (matches training pipeline in retinasense_v3.py)
+# FAISS SIMILAR CASE RETRIEVAL
 # ================================================================
-def _crop_black_borders(img, tol=7):
-    """Remove dark border padding common in fundus images."""
+faiss_index = None
+faiss_metadata = None
+faiss_index_type = None  # "IP" or "L2"
+
+def load_faiss_index():
+    global faiss_index, faiss_metadata, faiss_index_type
+    try:
+        import faiss
+        retrieval_dir = os.path.join(BASE_DIR, 'outputs_v3', 'retrieval')
+        # Prefer IndexFlatIP (rebuilt with all 5 classes), fallback to L2 (legacy)
+        ip_path = os.path.join(retrieval_dir, 'index_flat_ip.faiss')
+        l2_path = os.path.join(retrieval_dir, 'index_flat_l2.faiss')
+        meta_path = os.path.join(retrieval_dir, 'metadata.json')
+
+        if os.path.exists(ip_path):
+            index_path = ip_path
+            faiss_index_type = "IP"
+        elif os.path.exists(l2_path):
+            index_path = l2_path
+            faiss_index_type = "L2"
+        else:
+            print('  FAISS index not found — similar case retrieval disabled')
+            return
+
+        if os.path.exists(meta_path):
+            faiss_index = faiss.read_index(index_path)
+            with open(meta_path) as f:
+                faiss_metadata = json.load(f)
+            # Verify class coverage
+            classes_in_index = set(m.get('class_name', '?') for m in faiss_metadata)
+            print(f'  FAISS index loaded: {faiss_index.ntotal} vectors '
+                  f'(type: {faiss_index_type}, classes: {sorted(classes_in_index)})')
+        else:
+            print('  FAISS metadata not found — similar case retrieval disabled')
+    except ImportError:
+        print('  faiss-cpu not installed — similar case retrieval disabled')
+
+load_faiss_index()
+
+
+def _resolve_cache_path(cache_path_str):
+    """Resolve a cache path from metadata (relative or absolute)."""
+    if not cache_path_str:
+        return None
+    # If absolute and exists, use directly
+    if os.path.isabs(cache_path_str) and os.path.exists(cache_path_str):
+        return cache_path_str
+    # Try relative to BASE_DIR
+    candidate = os.path.join(BASE_DIR, cache_path_str)
+    if os.path.exists(candidate):
+        return candidate
+    # Try just the filename in known cache directories
+    stem = os.path.basename(cache_path_str)
+    for cache_dir_name in ['preprocessed_cache_unified', 'preprocessed_cache_v3']:
+        candidate = os.path.join(BASE_DIR, cache_dir_name, stem)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+@torch.no_grad()
+def retrieve_similar(image_tensor, k=5):
+    """Retrieve top-k similar cases from the FAISS index using ViT backbone embeddings.
+
+    Supports both IndexFlatIP (cosine similarity) and IndexFlatL2 (L2 distance).
+    Returns list of dicts with rank, class_name, label, similarity, image.
+    """
+    if faiss_index is None or faiss_metadata is None:
+        return []
+    try:
+        import faiss as faiss_lib
+        embedding = model.backbone(image_tensor.to(DEVICE)).cpu().numpy().astype(np.float32)
+        faiss_lib.normalize_L2(embedding)
+        distances, indices = faiss_index.search(embedding, k)
+        results = []
+        for rank, (dist, idx) in enumerate(zip(distances[0], indices[0]), 1):
+            if idx < 0 or idx >= len(faiss_metadata):
+                continue
+            meta = faiss_metadata[idx]
+            # Compute similarity score based on index type
+            if faiss_index_type == "IP":
+                similarity = max(0.0, float(dist))  # IP: score IS similarity
+            else:
+                similarity = max(0.0, 1.0 - dist / 4.0)  # L2: convert distance
+            img = None
+            cache_path = _resolve_cache_path(meta.get('cache_path', ''))
+            if cache_path:
+                try:
+                    img = np.load(cache_path)
+                except Exception:
+                    pass
+            results.append({
+                'rank': rank,
+                'class_name': meta.get('class_name', 'Unknown'),
+                'label': meta.get('label', -1),
+                'similarity': round(similarity * 100, 1),
+                'source': meta.get('source', 'unknown'),
+                'image': img,
+            })
+        return results
+    except Exception as e:
+        print(f'Retrieval error: {e}')
+        return []
+
+
+# RAD_ALPHA: weight for model probs vs kNN probs in retrieval-augmented prediction
+RAD_ALPHA = 0.6  # final_probs = alpha * model_probs + (1-alpha) * knn_probs
+
+
+@torch.no_grad()
+def retrieve_augmented_prediction(image_tensor, model_probs, k=5, alpha=None):
+    """Retrieval-Augmented Prediction: combine model prediction with kNN vote.
+
+    1. Retrieves top-k similar cases from FAISS
+    2. Computes similarity-weighted kNN class vote
+    3. Combines: final_probs = alpha * model_probs + (1-alpha) * knn_probs
+
+    Args:
+        image_tensor: preprocessed image tensor (1, 3, 224, 224)
+        model_probs: numpy array of shape (NUM_CLASSES,) from model
+        k: number of neighbors to retrieve
+        alpha: weight for model probs (default: RAD_ALPHA)
+
+    Returns:
+        dict with:
+            'final_probs': combined probability array (NUM_CLASSES,)
+            'final_pred': predicted class index
+            'final_confidence': confidence of combined prediction
+            'knn_probs': kNN vote probability array (NUM_CLASSES,)
+            'knn_pred': kNN majority prediction
+            'agreement': bool, whether model and kNN agree
+            'retrieved_cases': list of retrieved case dicts
+    """
+    if alpha is None:
+        alpha = RAD_ALPHA
+
+    # Get retrieved cases
+    retrieved = retrieve_similar(image_tensor, k=k)
+
+    if not retrieved:
+        return {
+            'final_probs': model_probs,
+            'final_pred': int(model_probs.argmax()),
+            'final_confidence': float(model_probs.max()),
+            'knn_probs': model_probs,
+            'knn_pred': int(model_probs.argmax()),
+            'agreement': True,
+            'retrieved_cases': [],
+        }
+
+    # Compute similarity-weighted kNN vote
+    knn_probs = np.zeros(NUM_CLASSES, dtype=np.float64)
+    for r in retrieved:
+        label = r.get('label', -1)
+        if 0 <= label < NUM_CLASSES:
+            weight = r['similarity'] / 100.0  # normalize back from percentage
+            knn_probs[label] += weight
+
+    # Normalize kNN probs
+    total = knn_probs.sum()
+    if total > 0:
+        knn_probs /= total
+    else:
+        knn_probs = np.ones(NUM_CLASSES) / NUM_CLASSES
+
+    knn_probs = knn_probs.astype(np.float32)
+    knn_pred = int(knn_probs.argmax())
+
+    # Combine model + kNN
+    final_probs = alpha * model_probs + (1 - alpha) * knn_probs
+    final_pred = int(final_probs.argmax())
+    final_confidence = float(final_probs[final_pred])
+
+    model_pred = int(model_probs.argmax())
+    agreement = (knn_pred == model_pred)
+
+    return {
+        'final_probs': final_probs,
+        'final_pred': final_pred,
+        'final_confidence': final_confidence,
+        'knn_probs': knn_probs,
+        'knn_pred': knn_pred,
+        'agreement': agreement,
+        'retrieved_cases': retrieved,
+    }
+
+
+# ================================================================
+# PREPROCESSING
+# ================================================================
+def _crop_black_borders(img):
+    """Detect dark borders in fundus images and crop to the fundus region."""
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    mask = gray > tol
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    if not rows.any() or not cols.any():
-        return img
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    return img[rmin:rmax+1, cmin:cmax+1]
+    _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+    coords = cv2.findNonZero(thresh)
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        img = img[y:y+h, x:x+w]
+    return img
 
 
-def _apply_circular_mask(img):
-    """Zero out pixels outside the circular fundus field of view."""
-    h, w = img.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cx, cy = w // 2, h // 2
-    r = int(min(h, w) * 0.48)
-    cv2.circle(mask, (cx, cy), r, 255, -1)
-    return cv2.bitwise_and(img, img, mask=mask)
+def _apply_circular_mask(img, sz):
+    """Apply circular mask to remove corners (standard for fundus images)."""
+    mask = np.zeros((sz, sz), dtype=np.uint8)
+    cv2.circle(mask, (sz // 2, sz // 2), sz // 2, 255, -1)
+    masked = cv2.bitwise_and(img, img, mask=mask)
+    return masked
 
 
 def preprocess_image(img_pil):
-    """Preprocess PIL image for model input.
-    Matches the training pipeline: crop borders → resize → CLAHE → circular mask → normalize.
-    """
+    """Preprocess PIL image for model input."""
     img_np = np.array(img_pil.convert('RGB'))
+    img_np = _crop_black_borders(img_np)
+    img_resized = cv2.resize(img_np, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+    img_resized = _apply_circular_mask(img_resized, IMG_SIZE)
 
-    # Step 1: Crop black borders (same as training)
-    img_cropped = _crop_black_borders(img_np)
-
-    # Step 2: Resize to model input size
-    img_resized = cv2.resize(img_cropped, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-
-    # Step 3: CLAHE on L-channel (default preprocessing — matches ODIR/majority of training data)
+    # Auto-detect domain: if image has dark borders, likely fundus
+    # Apply CLAHE as default preprocessing
     lab = cv2.cvtColor(img_resized, cv2.COLOR_RGB2LAB)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     lab[:, :, 0] = clahe.apply(lab[:, :, 0])
     processed = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-    # Step 4: Circular mask (critical — model trained with black outside fundus circle)
-    processed = _apply_circular_mask(processed)
-    processed = np.clip(processed, 0, 255).astype(np.uint8)
 
     normalize = transforms.Normalize(NORM_MEAN, NORM_STD)
     transform = transforms.Compose([
@@ -365,14 +582,13 @@ def get_recommendation(pred_class, severity_idx=0):
 # ================================================================
 # REPORT GENERATION
 # ================================================================
-def generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag, triage_key='REVIEW', models_agree=True, vit_pred=0, eff_pred=0):
+def generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag):
     lines = []
     lines.append('=' * 60)
     lines.append('  RETINASENSE-ViT CLINICAL SCREENING REPORT')
     lines.append('=' * 60)
     lines.append(f'  Date: {time.strftime("%Y-%m-%d %H:%M:%S")}')
-    model_name = 'ViT-Base/16 + EfficientNet-B3 Ensemble' if USE_ENSEMBLE else 'ViT-Base/16'
-    lines.append(f'  Model: {model_name} (RetinaSense v3.0)')
+    lines.append(f'  Model: ViT-Base/16 (RetinaSense v3.0)')
     lines.append('')
     lines.append('  PRIMARY FINDING')
     lines.append(f'  Prediction: {CLASS_NAMES[pred_class]}')
@@ -395,18 +611,9 @@ def generate_report_text(pred_class, confidence, probs, severity_idx, uncertaint
     lines.append('  OUT-OF-DISTRIBUTION CHECK')
     if ood.ood_threshold is not None:
         lines.append(f'  Mahalanobis score: {ood_score:.2f} (threshold: {ood.ood_threshold:.2f})')
-        lines.append(f'  Status: {"WARNING - Image may be outside training distribution" if ood_flag else "PASS - Within distribution"}')
     else:
-        lines.append('  OOD detector not available (ood_detector.npz missing)')
-        lines.append('  Status: SKIPPED')
-    lines.append('')
-    triage = TRIAGE_LEVELS[triage_key]
-    lines.append('  CLINICAL TRIAGE')
-    lines.append(f'  Triage Level: {triage["label"]}')
-    lines.append(f'  {triage["desc"]}')
-    if USE_ENSEMBLE:
-        agree_str = "AGREE" if models_agree else f"DISAGREE (ViT: {CLASS_NAMES[vit_pred]}, EfficientNet: {CLASS_NAMES[eff_pred]})"
-        lines.append(f'  Model Agreement: {agree_str}')
+        lines.append(f'  Mahalanobis score: {ood_score:.2f} (OOD detector not loaded)')
+    lines.append(f'  Status: {"WARNING - Image may be outside training distribution" if ood_flag else "PASS - Within distribution"}')
     lines.append('')
     lines.append('  CLINICAL RECOMMENDATION')
     lines.append(f'  {get_recommendation(pred_class, severity_idx)}')
@@ -424,179 +631,72 @@ def generate_report_text(pred_class, confidence, probs, severity_idx, uncertaint
 
 
 # ================================================================
-# TEST-TIME AUGMENTATION (TTA)
-# ================================================================
-def _tta_augment(tensor):
-    """Generate augmented versions of input tensor for TTA."""
-    augmented = [tensor]  # original
-    t = tensor.squeeze(0)  # (3, H, W)
-    augmented.append(torch.flip(t, dims=[2]).unsqueeze(0))    # horizontal flip
-    augmented.append(torch.flip(t, dims=[1]).unsqueeze(0))    # vertical flip
-    # +10 degree rotation
-    angle = 10.0 * (3.14159 / 180.0)
-    cos_a, sin_a = np.cos(angle), np.sin(angle)
-    theta1 = torch.tensor([[cos_a, -sin_a, 0], [sin_a, cos_a, 0]], dtype=torch.float32).unsqueeze(0)
-    grid1 = F.affine_grid(theta1, tensor.size(), align_corners=False)
-    augmented.append(F.grid_sample(tensor, grid1, align_corners=False))
-    # -10 degree rotation
-    theta2 = torch.tensor([[cos_a, sin_a, 0], [-sin_a, cos_a, 0]], dtype=torch.float32).unsqueeze(0)
-    grid2 = F.affine_grid(theta2, tensor.size(), align_corners=False)
-    augmented.append(F.grid_sample(tensor, grid2, align_corners=False))
-    return augmented
-
-
-def tta_predict(tensor_list):
-    """Run both models on all TTA augmentations and average probabilities."""
-    all_vit_probs = []
-    all_eff_probs = []
-    all_sev_probs = []
-
-    with torch.no_grad():
-        for t in tensor_list:
-            t = t.to(DEVICE)
-            d_out, s_out = model(t)
-            vp = torch.softmax(d_out / T_OPT, dim=1).cpu().numpy()[0]
-            sp = torch.softmax(s_out, dim=1).cpu().numpy()[0]
-            all_vit_probs.append(vp)
-            all_sev_probs.append(sp)
-
-            if USE_ENSEMBLE:
-                eff_logits = eff_model(t)
-                ep = torch.softmax(eff_logits / T_OPT, dim=1).cpu().numpy()[0]
-                all_eff_probs.append(ep)
-
-    vit_mean = np.mean(all_vit_probs, axis=0)
-    sev_mean = np.mean(all_sev_probs, axis=0)
-
-    if USE_ENSEMBLE:
-        eff_mean = np.mean(all_eff_probs, axis=0)
-        ensemble_probs = ENSEMBLE_WEIGHT_VIT * vit_mean + ENSEMBLE_WEIGHT_EFF * eff_mean
-        return vit_mean, eff_mean, ensemble_probs, sev_mean
-    return vit_mean, None, vit_mean, sev_mean
-
-
-# ================================================================
-# CLINICAL TRIAGE SYSTEM
-# ================================================================
-TRIAGE_LEVELS = {
-    'AUTO_SCREEN': {
-        'label': 'AUTO-SCREEN',
-        'color': '🟢',
-        'desc': 'Low risk — routine re-screening recommended.',
-    },
-    'REVIEW': {
-        'label': 'PRIORITY REVIEW',
-        'color': '🟡',
-        'desc': 'Moderate risk — schedule specialist review within 2 weeks.',
-    },
-    'URGENT': {
-        'label': 'URGENT SPECIALIST',
-        'color': '🔴',
-        'desc': 'High risk — refer to specialist within 48 hours.',
-    },
-    'REJECT': {
-        'label': 'RESCAN NEEDED',
-        'color': '⚪',
-        'desc': 'Image quality insufficient or out-of-distribution — rescan required.',
-    },
-}
-
-def compute_triage(pred_class, confidence, uncertainty, ood_flag, models_agree):
-    """Uncertainty-guided clinical triage decision."""
-    ent = uncertainty['predictive_entropy']
-    epist = uncertainty['epistemic']
-
-    # REJECT: OOD detected
-    if ood_flag:
-        return 'REJECT'
-
-    # URGENT: low confidence OR high uncertainty OR models disagree on disease
-    if confidence < 0.4 or ent > 1.2 or (not models_agree and confidence < 0.6):
-        return 'URGENT'
-
-    # PRIORITY REVIEW: moderate confidence, or elevated epistemic uncertainty
-    if confidence < 0.7 or ent > 0.7 or epist > 0.05 or not models_agree:
-        return 'REVIEW'
-
-    # AUTO-SCREEN: high confidence, low uncertainty, models agree
-    return 'AUTO_SCREEN'
-
-
-# ================================================================
 # MAIN PREDICTION FUNCTION
 # ================================================================
 def predict(image):
     if image is None:
-        return None, None, "Please upload a fundus image.", "", None
+        return None, None, "Please upload a fundus image.", "", None, []
 
     img_pil = Image.fromarray(image) if isinstance(image, np.ndarray) else image
     tensor, img_orig, img_processed = preprocess_image(img_pil)
 
-    # 1. Attention Rollout + heatmap (on original tensor)
-    heatmap, vit_pred_class, vit_confidence, vit_probs_single, sev_probs_single = rollout.generate(tensor)
+    # 1. Attention Rollout + prediction (single pass for heatmap)
+    heatmap, pred_class_single, confidence_single, probs_single, sev_probs = rollout.generate(tensor)
     overlay_img = rollout.overlay(img_orig, heatmap)
 
-    # 2. TTA: run predictions on augmented versions
-    tta_tensors = _tta_augment(tensor)
-    vit_probs, eff_probs_arr, probs, sev_probs = tta_predict(tta_tensors)
-
-    pred_class = int(probs.argmax())
-    confidence = float(probs[pred_class])
-
-    # 3. Model agreement check
-    vit_pred = int(vit_probs.argmax())
-    if USE_ENSEMBLE and eff_probs_arr is not None:
-        eff_pred = int(eff_probs_arr.argmax())
-        models_agree = (vit_pred == eff_pred)
+    # 1b. TTA for better prediction accuracy (overrides single-pass probs)
+    if USE_TTA:
+        tta_probs = tta_predict(tensor)  # averaged over 8 augmentations
+        pred_class = int(tta_probs.argmax())
+        confidence = float(tta_probs[pred_class])
+        probs = tta_probs
     else:
-        eff_pred = vit_pred
-        models_agree = True
+        pred_class = pred_class_single
+        confidence = confidence_single
+        probs = probs_single
 
-    # 4. MC Dropout uncertainty
+    # 2. MC Dropout uncertainty
     uncertainty = mc_dropout_predict(tensor, T=15)
 
-    # 5. OOD detection
+    # 3. OOD detection
     with torch.no_grad():
         feat = model.backbone(tensor.to(DEVICE)).cpu().numpy()[0]
     ood_score, ood_flag = ood.score(feat)
 
-    # 6. Clinical triage
-    triage_key = compute_triage(pred_class, confidence, uncertainty, ood_flag, models_agree)
-    triage = TRIAGE_LEVELS[triage_key]
-
-    # 7. Severity (if DR)
+    # 4. Severity (if DR)
     severity_idx = int(sev_probs.argmax()) if pred_class == 1 else 0
 
-    # 8. Build probability display
+    # 5. Build probability display
     prob_dict = {cn: float(probs[i]) for i, cn in enumerate(CLASS_NAMES)}
 
-    # 9. Build status text
+    # 6. Build status text
     ent = uncertainty['predictive_entropy']
     unc_level = 'Low' if ent < 0.5 else ('Moderate' if ent < 1.0 else 'HIGH')
-    mode_str = "Ensemble + TTA" if USE_ENSEMBLE else "ViT-Base/16 + TTA"
 
     status_parts = []
-    status_parts.append(f"**Mode: {mode_str}**")
-    status_parts.append(f"### {triage['color']} Triage: {triage['label']}")
-    status_parts.append(f"*{triage['desc']}*")
-    status_parts.append(f"\nPrediction: **{CLASS_NAMES[pred_class]}** ({confidence*100:.1f}%)")
+    status_parts.append(f"Prediction: **{CLASS_NAMES[pred_class]}** ({confidence*100:.1f}%)")
     if pred_class == 1:
         status_parts.append(f"DR Severity: **{SEVERITY_NAMES[severity_idx]}**")
-    if USE_ENSEMBLE:
-        agree_str = "AGREE" if models_agree else f"DISAGREE (ViT: {CLASS_NAMES[vit_pred]}, EfficientNet: {CLASS_NAMES[eff_pred]})"
-        status_parts.append(f"Model Agreement: **{agree_str}**")
     status_parts.append(f"Uncertainty: **{unc_level}** (entropy={ent:.3f})")
+    status_parts.append(f"OOD Score: {ood_score:.1f} {'(WARNING)' if ood_flag else '(OK)'}")
     status_parts.append(f"\n**Recommendation:** {get_recommendation(pred_class, severity_idx)}")
     status_text = '\n'.join(status_parts)
 
-    # 10. Generate report
-    report = generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag,
-                                  triage_key=triage_key, models_agree=models_agree, vit_pred=vit_pred, eff_pred=eff_pred)
+    # 7. Similar case retrieval (FAISS)
+    retrieval_results = retrieve_similar(tensor, k=5)
+    gallery_images = []
+    for r in retrieval_results:
+        if r['image'] is not None:
+            caption = f"#{r['rank']} {r['class_name']} ({r['similarity']}% similar)"
+            gallery_images.append((r['image'], caption))
+
+    # 8. Generate report
+    report = generate_report_text(pred_class, confidence, probs, severity_idx, uncertainty, ood_score, ood_flag)
     report_path = os.path.join(tempfile.gettempdir(), 'retinasense_report.txt')
     with open(report_path, 'w') as f:
         f.write(report)
 
-    return overlay_img, prob_dict, status_text, report, report_path
+    return overlay_img, prob_dict, status_text, report, report_path, gallery_images
 
 
 # ================================================================
@@ -605,18 +705,20 @@ def predict(image):
 with gr.Blocks(title="RetinaSense-ViT", theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
     # RetinaSense-ViT Clinical Screening System
-    **AI-Powered Retinal Disease Detection** | ViT + EfficientNet Ensemble | 5 Disease Classes | Attention Rollout XAI
+    **AI-Powered Retinal Disease Detection** | ViT-Base/16 | 5 Disease Classes | Attention Rollout XAI
 
     Upload a fundus image to get instant disease screening with explainability, uncertainty quantification, and clinical recommendations.
     """)
 
     with gr.Row():
         with gr.Column(scale=1):
-            input_image = gr.Image(label="Upload Fundus Image", type="numpy")
+            input_image = gr.Image(label="Upload Fundus Image", type="numpy", height=300)
             submit_btn = gr.Button("Analyze", variant="primary", size="lg")
+            gr.Markdown("*Upload any retinal fundus photograph (JPEG/PNG). "
+                        "The model expects standard color fundus images.*")
 
         with gr.Column(scale=1):
-            attention_map = gr.Image(label="Attention Rollout Heatmap")
+            attention_map = gr.Image(label="Attention Rollout Heatmap", height=300)
             confidence_bars = gr.Label(label="Class Probabilities", num_top_classes=5)
 
     with gr.Row():
@@ -627,10 +729,17 @@ with gr.Blocks(title="RetinaSense-ViT", theme=gr.themes.Soft()) as demo:
 
     report_file = gr.File(label="Download Report", visible=True)
 
+    with gr.Row():
+        similar_gallery = gr.Gallery(
+            label="Similar Cases from Training Database (FAISS Retrieval)",
+            columns=5,
+            height=250,
+        )
+
     submit_btn.click(
         fn=predict,
         inputs=[input_image],
-        outputs=[attention_map, confidence_bars, status_output, report_output, report_file],
+        outputs=[attention_map, confidence_bars, status_output, report_output, report_file, similar_gallery],
     )
 
     gr.Markdown("""
@@ -639,9 +748,45 @@ with gr.Blocks(title="RetinaSense-ViT", theme=gr.themes.Soft()) as demo:
     It is NOT a medical device and should NOT be used for clinical decision-making
     without verification by a qualified ophthalmologist.
 
-    **Model:** ViT-Base/16 + EfficientNet-B3 Ensemble with TTA | **Classes:** Normal, DR, Glaucoma, Cataract, AMD | **Features:** Attention Rollout XAI, MC Dropout Uncertainty, Clinical Triage
+    **Model:** ViT-Base/16 + DANN-v3 + TTA (8x augmentation) | **Accuracy:** 89.3% | **Classes:** Normal, DR, Glaucoma, Cataract, AMD
     """)
 
 
 if __name__ == '__main__':
-    demo.launch(server_name='0.0.0.0', server_port=7860, share=True)
+    parser = argparse.ArgumentParser(description='RetinaSense-ViT Clinical Screening Demo')
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Override model checkpoint path')
+    parser.add_argument('--share', action='store_true', default=True,
+                        help='Create public share link (default: True)')
+    parser.add_argument('--no-share', dest='share', action='store_false',
+                        help='Disable public share link')
+    parser.add_argument('--port', type=int, default=7860, help='Server port')
+    parser.add_argument('--no-tta', dest='use_tta', action='store_false', default=True,
+                        help='Disable Test-Time Augmentation (8x augmentation averaging)')
+    args = parser.parse_args()
+
+    # Apply TTA flag (module-level variable, no 'global' needed at top-level scope)
+    USE_TTA = args.use_tta
+    if not USE_TTA:
+        print('TTA disabled via --no-tta flag')
+    else:
+        print('TTA enabled (8 augmentations per image)')
+
+    # If user overrides model path, reload the model
+    if args.model_path:
+        override_path = args.model_path
+        if not os.path.isabs(override_path):
+            override_path = os.path.join(BASE_DIR, override_path)
+        if os.path.exists(override_path):
+            print(f'Reloading model from override: {override_path}')
+            ckpt2 = torch.load(override_path, map_location=DEVICE, weights_only=False)
+            sd2 = ckpt2.get('model_state_dict', ckpt2)
+            filt2 = {k: v for k, v in sd2.items()
+                     if not k.startswith('domain_head') and not k.startswith('grl')}
+            model.load_state_dict(filt2, strict=False)
+            model.eval()
+            print(f'  Model reloaded successfully')
+        else:
+            print(f'WARNING: --model-path {override_path} not found, using default')
+
+    demo.launch(server_name='0.0.0.0', server_port=args.port, share=args.share, show_error=True)

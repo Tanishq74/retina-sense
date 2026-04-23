@@ -19,6 +19,7 @@ data/
 preprocessed_cache/
 preprocessed_cache_v3/
 preprocessed_cache_vit/
+preprocessed_cache_unified/
 
 # ===== Output directories (models, results, gradcam) =====
 outputs/
@@ -89,6 +90,15 @@ diagnose_model.py
 # ===== Claude Code =====
 .claude.json
 .claude/
+.claude-mem/
+
+# ===== Credentials =====
+kaggle.json
+
+# ===== Runtime / tool caches =====
+.bun/
+.gradio/
+weights/
 
 # ===== System / dotfiles =====
 /.bashrc

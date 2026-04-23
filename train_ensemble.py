@@ -40,12 +40,15 @@ MIXUP_ALPHA = 0.4
 FOCAL_GAMMA = 1.0
 GRAD_ACCUM = 2
 NUM_WORKERS = 8
-CACHE_DIR = './preprocessed_cache_v3'
+CACHE_DIR = './preprocessed_cache_unified'
 OUTPUT_DIR = './outputs_v3/ensemble'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Load norm stats
-with open('./data/fundus_norm_stats.json') as f:
+_norm_path = './configs/fundus_norm_stats_unified.json'
+if not os.path.exists(_norm_path):
+    _norm_path = './data/fundus_norm_stats.json'
+with open(_norm_path) as f:
     ns = json.load(f)
 NORM_MEAN, NORM_STD = ns['mean_rgb'], ns['std_rgb']
 
@@ -102,6 +105,13 @@ class RetinalDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         cache_fp = row.get('cache_path', _cache_key(row['image_path']))
+        # Prefer unified cache
+        if isinstance(cache_fp, str):
+            unified = cache_fp.replace('preprocessed_cache_v3', 'preprocessed_cache_unified')
+            if os.path.exists(unified):
+                cache_fp = unified
+            elif not os.path.isabs(cache_fp):
+                cache_fp = os.path.join('.', cache_fp.lstrip('./'))
         try:
             img = np.load(cache_fp)
         except Exception:
@@ -348,8 +358,14 @@ class MultiTaskViT(nn.Module):
 
 
 vit_model = MultiTaskViT().to(DEVICE)
-ckpt = torch.load('./outputs_v3/best_model.pth', map_location=DEVICE, weights_only=False)
-vit_model.load_state_dict(ckpt['model_state_dict'])
+_vit_path = './outputs_v3/dann/best_model.pth'
+if not os.path.exists(_vit_path):
+    _vit_path = './outputs_v3/best_model.pth'
+ckpt = torch.load(_vit_path, map_location=DEVICE, weights_only=False)
+_sd = ckpt['model_state_dict']
+_filtered = {k: v for k, v in _sd.items()
+             if not k.startswith('domain_head') and not k.startswith('grl')}
+vit_model.load_state_dict(_filtered, strict=False)
 vit_model.eval()
 
 # Load best EfficientNet
@@ -358,10 +374,13 @@ model.load_state_dict(ckpt_eff['model_state_dict'])
 model.eval()
 
 # Load temperature
-with open('./outputs_v3/temperature.json') as f:
+_temp_path = './configs/temperature.json'
+if not os.path.exists(_temp_path):
+    _temp_path = './outputs_v3/temperature.json'
+with open(_temp_path) as f:
     T_opt = json.load(f)['temperature']
 
-print(f'  ViT checkpoint: epoch {ckpt["epoch"]+1}, F1={ckpt["macro_f1"]:.4f}')
+print(f'  ViT checkpoint: epoch {ckpt.get("epoch",0)+1}, F1={ckpt.get("macro_f1",0):.4f}')
 print(f'  EfficientNet checkpoint: epoch {ckpt_eff["epoch"]+1}, F1={ckpt_eff["macro_f1"]:.4f}')
 print(f'  Temperature: {T_opt:.4f}')
 

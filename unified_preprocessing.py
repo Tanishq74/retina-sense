@@ -1,214 +1,401 @@
 #!/usr/bin/env python3
 """
-RetinaSense — Unified Preprocessing Pipeline
-=============================================
-Replaces the domain-conditional preprocessing (Ben Graham for APTOS, CLAHE for ODIR)
-with a single CLAHE pipeline for ALL images. This eliminates the domain shift that
-caused the ViT to learn source-specific features instead of disease features.
+unified_preprocessing.py — Unified CLAHE preprocessing for RetinaSense-ViT
+
+Applies the SAME CLAHE pipeline to ALL fundus images regardless of source
+(APTOS or ODIR), eliminating the domain shift caused by different preprocessing
+strategies. Saves preprocessed images as .npy files in preprocessed_cache_unified/.
 
 Usage:
-    # Rebuild the entire cache with unified preprocessing
-    python unified_preprocessing.py
-
-    # Or import and use in training scripts:
-    from unified_preprocessing import unified_preprocess, rebuild_cache
+    python unified_preprocessing.py                 # Rebuild full cache
+    python unified_preprocessing.py --recompute-stats  # Only recompute norm stats
+    python unified_preprocessing.py --verify           # Verify cache completeness
 """
 
-import os, json, sys
+import os
+import sys
+import json
+import argparse
+from pathlib import Path
+
 import numpy as np
 import cv2
 import pandas as pd
 from tqdm import tqdm
+from PIL import Image
 
-TARGET_SIZE = 224
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(BASE_DIR, "preprocessed_cache_unified")
+CONFIGS_DIR = os.path.join(BASE_DIR, "configs")
+NORM_STATS_PATH = os.path.join(CONFIGS_DIR, "fundus_norm_stats_unified.json")
+DEFAULT_SIZE = 224
+
+CSV_PATHS = [
+    os.path.join(BASE_DIR, "data", "combined_dataset.csv"),
+    os.path.join(BASE_DIR, "data", "train_split.csv"),
+    os.path.join(BASE_DIR, "data", "calib_split.csv"),
+    os.path.join(BASE_DIR, "data", "test_split.csv"),
+]
 
 
-def _crop_black_borders(img, tol=7):
-    """Remove dark border padding common in fundus images."""
+# ---------------------------------------------------------------------------
+# Image I/O helpers
+# ---------------------------------------------------------------------------
+def read_rgb(path: str) -> np.ndarray:
+    """Read an image file and return as RGB numpy array.
+
+    Tries OpenCV first, falls back to PIL for uncommon formats.
+    """
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is not None:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # Fallback: PIL handles more formats (e.g. TIFF, WebP)
+    pil_img = Image.open(path).convert("RGB")
+    return np.array(pil_img)
+
+
+def resolve_image_path(raw_path: str) -> str:
+    """Resolve a potentially relative CSV image path to an absolute path.
+
+    Strips leading './' or './/' and joins with BASE_DIR.
+    """
+    cleaned = raw_path
+    # Strip leading .// or ./
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    abs_path = os.path.join(BASE_DIR, cleaned)
+    return abs_path
+
+
+def cache_key(image_path: str, sz: int = DEFAULT_SIZE) -> str:
+    """Derive cache filename: {stem}_{sz}.npy"""
+    stem = Path(image_path).stem
+    return f"{stem}_{sz}.npy"
+
+
+# ---------------------------------------------------------------------------
+# Core preprocessing
+# ---------------------------------------------------------------------------
+def crop_black_borders(img: np.ndarray, threshold: int = 10) -> np.ndarray:
+    """Crop dark borders from a fundus image.
+
+    Converts to grayscale, finds rows/cols whose mean intensity exceeds
+    *threshold*, and crops to that bounding box. Returns the original image
+    if no valid crop region is found.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    mask = gray > tol
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    if not rows.any() or not cols.any():
+
+    # Row means and column means
+    row_means = gray.mean(axis=1)
+    col_means = gray.mean(axis=0)
+
+    rows_above = np.where(row_means > threshold)[0]
+    cols_above = np.where(col_means > threshold)[0]
+
+    if len(rows_above) == 0 or len(cols_above) == 0:
+        return img  # Nothing to crop — return as-is
+
+    y_min, y_max = rows_above[0], rows_above[-1]
+    x_min, x_max = cols_above[0], cols_above[-1]
+
+    # Guard: don't crop to something absurdly small
+    if (y_max - y_min) < 10 or (x_max - x_min) < 10:
         return img
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    return img[rmin:rmax+1, cmin:cmax+1]
+
+    return img[y_min : y_max + 1, x_min : x_max + 1]
 
 
-def _apply_circular_mask(img):
-    """Zero out pixels outside the circular fundus field of view."""
-    h, w = img.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cx, cy = w // 2, h // 2
-    r = int(min(h, w) * 0.48)
-    cv2.circle(mask, (cx, cy), r, 255, -1)
-    return cv2.bitwise_and(img, img, mask=mask)
+def unified_clahe(path: str, sz: int = DEFAULT_SIZE) -> np.ndarray:
+    """Single CLAHE pipeline for all sources. No domain-conditional branching.
 
-
-def unified_preprocess(img, target_size=TARGET_SIZE):
-    """Unified CLAHE preprocessing for ALL images regardless of source.
-
-    Pipeline: crop borders -> resize -> CLAHE on L-channel -> circular mask
-
-    Args:
-        img: RGB numpy array (any size)
-        target_size: output size (default 224)
+    Steps:
+        1. Read image as RGB
+        2. Crop black borders (fundus images often have dark surrounds)
+        3. Resize to (sz, sz)
+        4. Apply CLAHE on L-channel in LAB colour space
+        5. Apply circular mask to isolate fundus disc
 
     Returns:
-        Preprocessed uint8 RGB array of shape (target_size, target_size, 3)
+        np.ndarray — preprocessed RGB image, uint8, shape (sz, sz, 3)
     """
-    # Step 1: Crop black borders
-    img = _crop_black_borders(img)
+    img = read_rgb(path)
+    img = crop_black_borders(img)
+    img = cv2.resize(img, (sz, sz), interpolation=cv2.INTER_AREA)
 
-    # Step 2: Resize
-    img = cv2.resize(img, (target_size, target_size), interpolation=cv2.INTER_AREA)
-
-    # Step 3: CLAHE on L-channel (same params as ODIR training)
+    # CLAHE on L-channel
     lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l_eq = clahe.apply(l)
-    lab_eq = cv2.merge([l_eq, a, b])
-    img = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    # Step 4: Circular mask
-    img = _apply_circular_mask(img)
+    # Circular mask
+    mask = np.zeros(img.shape[:2], dtype=np.uint8)
+    cv2.circle(mask, (sz // 2, sz // 2), int(sz * 0.48), 255, -1)
+    img = cv2.bitwise_and(img, img, mask=mask)
 
-    return np.clip(img, 0, 255).astype(np.uint8)
-
-
-def unified_preprocess_from_path(image_path, target_size=TARGET_SIZE):
-    """Load an image from disk and apply unified preprocessing."""
-    img = cv2.imread(image_path)
-    if img is None:
-        return np.zeros((target_size, target_size, 3), dtype=np.uint8)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return unified_preprocess(img, target_size)
+    return img
 
 
-def compute_norm_stats(cache_dir, csv_path=None):
-    """Compute channel-wise mean and std from the preprocessed cache.
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
+def collect_all_image_paths() -> pd.DataFrame:
+    """Load and deduplicate image entries from all CSV files.
 
-    Should be run AFTER rebuilding the cache with unified preprocessing
-    to get updated normalization statistics.
+    Returns a DataFrame with at least columns: image_path, source (if present).
+    Training-split membership is tracked via an 'is_train' column.
     """
-    pixel_sum = np.zeros(3, dtype=np.float64)
-    pixel_sq_sum = np.zeros(3, dtype=np.float64)
-    n_pixels = 0
+    frames = []
+    train_paths_set = set()
 
-    npy_files = [f for f in os.listdir(cache_dir) if f.endswith('.npy')]
-    if csv_path:
-        df = pd.read_csv(csv_path)
-        npy_files = [os.path.basename(p) for p in df['cache_path'].values if os.path.exists(p)]
-
-    for fname in tqdm(npy_files, desc='Computing norm stats'):
-        fp = os.path.join(cache_dir, fname) if not os.path.isabs(fname) else fname
-        if not os.path.exists(fp):
+    for csv_path in CSV_PATHS:
+        if not os.path.isfile(csv_path):
+            print(f"[WARN] CSV not found, skipping: {csv_path}")
             continue
-        img = np.load(fp).astype(np.float64) / 255.0
-        pixel_sum += img.sum(axis=(0, 1))
-        pixel_sq_sum += (img ** 2).sum(axis=(0, 1))
-        n_pixels += img.shape[0] * img.shape[1]
+        df = pd.read_csv(csv_path)
+        if "image_path" not in df.columns:
+            print(f"[WARN] No 'image_path' column in {csv_path}, skipping.")
+            continue
 
-    mean = pixel_sum / n_pixels
-    std = np.sqrt(pixel_sq_sum / n_pixels - mean ** 2)
+        # Track training split membership
+        basename = os.path.basename(csv_path).lower()
+        if "train" in basename:
+            for p in df["image_path"]:
+                train_paths_set.add(resolve_image_path(str(p)))
 
-    return mean.tolist(), std.tolist()
+        frames.append(df)
 
-
-def rebuild_cache(csv_path, cache_dir, target_size=TARGET_SIZE):
-    """Rebuild the entire preprocessed cache using unified CLAHE preprocessing.
-
-    Args:
-        csv_path: Path to CSV with 'image_path' column
-        cache_dir: Directory to save .npy cache files
-        target_size: Image size (default 224)
-
-    Returns:
-        List of cache file paths
-    """
-    os.makedirs(cache_dir, exist_ok=True)
-    df = pd.read_csv(csv_path)
-    cache_paths = []
-    processed = 0
-
-    for _, row in tqdm(df.iterrows(), total=len(df), desc='Rebuilding cache'):
-        image_path = row['image_path']
-        stem = os.path.splitext(os.path.basename(image_path))[0]
-        cache_fp = os.path.join(cache_dir, f'{stem}_{target_size}.npy')
-
-        img = unified_preprocess_from_path(image_path, target_size)
-        np.save(cache_fp, img)
-        cache_paths.append(cache_fp)
-        processed += 1
-
-    print(f'  Processed {processed} images -> {cache_dir}/')
-    return cache_paths
-
-
-def main():
-    """Rebuild cache and recompute normalization stats."""
-    cache_dir = os.path.join(BASE_DIR, 'preprocessed_cache_unified')
-    data_dir = os.path.join(BASE_DIR, 'data')
-
-    # Check for data CSVs
-    combined_csv = os.path.join(data_dir, 'combined_dataset.csv')
-    train_csv = os.path.join(data_dir, 'train_split.csv')
-
-    if not os.path.exists(train_csv):
-        print('ERROR: data/train_split.csv not found.')
-        print('This script requires the training data CSVs and raw images.')
-        print('Run this on the GPU server where data is available.')
+    if not frames:
+        print("[ERROR] No valid CSVs found. Cannot proceed.")
         sys.exit(1)
 
-    print('=' * 60)
-    print('  RetinaSense — Unified Preprocessing Pipeline')
-    print('=' * 60)
-    print(f'  Cache dir: {cache_dir}')
-    print(f'  Target size: {TARGET_SIZE}x{TARGET_SIZE}')
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["image_path"], keep="first")
+    combined["abs_path"] = combined["image_path"].apply(lambda p: resolve_image_path(str(p)))
+    combined["is_train"] = combined["abs_path"].isin(train_paths_set)
+
+    print(f"Collected {len(combined)} unique images from {len(frames)} CSV(s).")
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Cache building
+# ---------------------------------------------------------------------------
+def build_cache(df: pd.DataFrame, sz: int = DEFAULT_SIZE) -> dict:
+    """Preprocess all images and save to cache directory.
+
+    Returns a summary dict with counts of total, newly_cached, skipped, failed.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    total = len(df)
+    newly_cached = 0
+    skipped = 0
+    failed = 0
+    failures = []
+
+    for _, row in tqdm(df.iterrows(), total=total, desc="Preprocessing"):
+        abs_path = row["abs_path"]
+        key = cache_key(abs_path, sz)
+        out_path = os.path.join(CACHE_DIR, key)
+
+        # Skip if already cached
+        if os.path.isfile(out_path):
+            skipped += 1
+            continue
+
+        try:
+            img = unified_clahe(abs_path, sz)
+            np.save(out_path, img)
+            newly_cached += 1
+        except Exception as exc:
+            failed += 1
+            failures.append((abs_path, str(exc)))
+
+    summary = {
+        "total": total,
+        "newly_cached": newly_cached,
+        "already_cached": skipped,
+        "failed": failed,
+        "failures": failures,
+    }
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Norm stats computation
+# ---------------------------------------------------------------------------
+def compute_norm_stats(df: pd.DataFrame, sz: int = DEFAULT_SIZE) -> dict:
+    """Compute per-channel mean and std over the training split only.
+
+    Reads cached .npy files. Pixels outside the circular mask (all-zero) are
+    excluded from statistics.
+
+    Returns dict with 'mean_rgb' and 'std_rgb' (each a list of 3 floats).
+    """
+    train_df = df[df["is_train"]]
+    if len(train_df) == 0:
+        print("[WARN] No training-split images identified. Computing stats over ALL images.")
+        train_df = df
+
+    print(f"Computing norm stats over {len(train_df)} training images...")
+
+    # Online Welford-style accumulation (two-pass for numerical stability)
+    channel_sum = np.zeros(3, dtype=np.float64)
+    channel_sq_sum = np.zeros(3, dtype=np.float64)
+    pixel_count = np.float64(0)
+
+    missing = 0
+    for _, row in tqdm(train_df.iterrows(), total=len(train_df), desc="Norm stats"):
+        key = cache_key(row["abs_path"], sz)
+        npy_path = os.path.join(CACHE_DIR, key)
+        if not os.path.isfile(npy_path):
+            missing += 1
+            continue
+
+        img = np.load(npy_path).astype(np.float64) / 255.0  # (H, W, 3)
+
+        # Mask: only count non-black pixels (inside the circular mask)
+        mask = img.sum(axis=2) > 0  # (H, W)
+        n_pixels = mask.sum()
+        if n_pixels == 0:
+            continue
+
+        for c in range(3):
+            vals = img[:, :, c][mask]
+            channel_sum[c] += vals.sum()
+            channel_sq_sum[c] += (vals ** 2).sum()
+        pixel_count += n_pixels
+
+    if missing > 0:
+        print(f"[WARN] {missing} cached files missing during norm stats computation.")
+
+    if pixel_count == 0:
+        print("[ERROR] No valid pixels found. Cannot compute stats.")
+        return {"mean_rgb": [0.0, 0.0, 0.0], "std_rgb": [1.0, 1.0, 1.0]}
+
+    mean_rgb = (channel_sum / pixel_count).tolist()
+    std_rgb = np.sqrt(channel_sq_sum / pixel_count - np.array(mean_rgb) ** 2).tolist()
+
+    stats = {"mean_rgb": mean_rgb, "std_rgb": std_rgb}
+    return stats
+
+
+def save_norm_stats(stats: dict) -> None:
+    """Save norm stats to JSON config file."""
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
+    with open(NORM_STATS_PATH, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Norm stats saved to {NORM_STATS_PATH}")
+    print(f"  mean_rgb: {[round(v, 4) for v in stats['mean_rgb']]}")
+    print(f"  std_rgb:  {[round(v, 4) for v in stats['std_rgb']]}")
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+def verify_cache(df: pd.DataFrame, sz: int = DEFAULT_SIZE) -> None:
+    """Check that every image in the dataset has a corresponding cache file."""
+    total = len(df)
+    present = 0
+    missing_files = []
+
+    for _, row in tqdm(df.iterrows(), total=total, desc="Verifying cache"):
+        key = cache_key(row["abs_path"], sz)
+        npy_path = os.path.join(CACHE_DIR, key)
+        if os.path.isfile(npy_path):
+            present += 1
+        else:
+            missing_files.append(row["abs_path"])
+
+    print(f"\nCache verification: {present}/{total} files present.")
+    if missing_files:
+        print(f"  {len(missing_files)} MISSING:")
+        for p in missing_files[:20]:
+            print(f"    - {p}")
+        if len(missing_files) > 20:
+            print(f"    ... and {len(missing_files) - 20} more.")
+    else:
+        print("  All cached. Cache is complete.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Unified CLAHE preprocessing for RetinaSense-ViT"
+    )
+    parser.add_argument(
+        "--recompute-stats",
+        action="store_true",
+        help="Only recompute norm stats from existing cache (skip preprocessing).",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify cache completeness without rebuilding.",
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=DEFAULT_SIZE,
+        help=f"Target image size (default: {DEFAULT_SIZE}).",
+    )
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("RetinaSense-ViT  —  Unified CLAHE Preprocessing")
+    print("=" * 60)
+    print(f"Base dir:   {BASE_DIR}")
+    print(f"Cache dir:  {CACHE_DIR}")
+    print(f"Image size: {args.size}")
     print()
 
-    # Rebuild cache for all splits
-    for split_name in ['train_split', 'calib_split', 'test_split']:
-        csv_path = os.path.join(data_dir, f'{split_name}.csv')
-        if os.path.exists(csv_path):
-            print(f'\n  Processing {split_name}...')
-            rebuild_cache(csv_path, cache_dir)
+    # Collect all image paths
+    df = collect_all_image_paths()
 
-    # Recompute normalization stats
-    print('\n  Computing new normalization statistics...')
-    mean, std = compute_norm_stats(cache_dir)
-    print(f'  New mean: {mean}')
-    print(f'  New std:  {std}')
+    if args.verify:
+        verify_cache(df, sz=args.size)
+        return
 
-    # Save new norm stats
-    stats_path = os.path.join(BASE_DIR, 'configs', 'fundus_norm_stats_unified.json')
-    with open(stats_path, 'w') as f:
-        json.dump({'mean_rgb': mean, 'std_rgb': std}, f, indent=2)
-    print(f'  Saved: {stats_path}')
+    if args.recompute_stats:
+        stats = compute_norm_stats(df, sz=args.size)
+        save_norm_stats(stats)
+        return
 
-    # Update the CSV files with new cache paths
-    for split_name in ['train_split', 'calib_split', 'test_split']:
-        csv_path = os.path.join(data_dir, f'{split_name}.csv')
-        if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-            df['cache_path'] = df['image_path'].apply(
-                lambda p: os.path.join(cache_dir,
-                    f'{os.path.splitext(os.path.basename(p))[0]}_{TARGET_SIZE}.npy')
-            )
-            unified_csv = csv_path.replace('.csv', '_unified.csv')
-            df.to_csv(unified_csv, index=False)
-            print(f'  Saved: {unified_csv}')
+    # Full rebuild: preprocess + compute stats
+    summary = build_cache(df, sz=args.size)
 
-    print('\n' + '=' * 60)
-    print('  Done! Next steps:')
-    print('  1. Update retinasense_v3.py to use preprocessed_cache_unified/')
-    print('  2. Update configs/fundus_norm_stats.json with the new stats')
-    print('  3. Retrain the model')
-    print('=' * 60)
+    print()
+    print("-" * 40)
+    print("Preprocessing Summary")
+    print("-" * 40)
+    print(f"  Total images:    {summary['total']}")
+    print(f"  Newly cached:    {summary['newly_cached']}")
+    print(f"  Already cached:  {summary['already_cached']}")
+    print(f"  Failed:          {summary['failed']}")
+
+    if summary["failures"]:
+        print("\n  Failed files:")
+        for path, err in summary["failures"][:20]:
+            print(f"    - {path}")
+            print(f"      Error: {err}")
+        if len(summary["failures"]) > 20:
+            print(f"    ... and {len(summary['failures']) - 20} more.")
+
+    # Compute and save norm stats
+    print()
+    stats = compute_norm_stats(df, sz=args.size)
+    save_norm_stats(stats)
+
+    print()
+    print("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

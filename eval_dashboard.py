@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-RetinaSense v3.0 -- Phase 1A: Rich Evaluation Dashboard
-========================================================
-Standalone script that loads the trained ViT model, runs inference on the
-full test set (1,281 images), and produces publication-quality evaluation
-plots plus a structured metrics JSON report.
+RetinaSense v3.0 -- Evaluation Dashboard
+=========================================
+Standalone script that loads a trained model, runs inference on the
+test/calib set, and produces publication-quality evaluation plots
+plus a structured metrics JSON report.
 
-Outputs (all written to outputs_v3/evaluation/):
-  - confusion_matrix.png
-  - roc_curves_per_class.png
-  - precision_recall_curves.png
-  - calibration_reliability.png
-  - confidence_histograms.png
-  - error_analysis_by_source.png
-  - metrics_report.json
+Supports CLI flags for recalibration, ensemble search, and final eval.
 
 Usage:
-  python eval_dashboard.py
+  python eval_dashboard.py                                    # default eval
+  python eval_dashboard.py --model outputs_v3/dann/best_model.pth
+  python eval_dashboard.py --recalibrate --calib-split data/calib_split.csv
+  python eval_dashboard.py --ensemble-search --vit MODEL --eff MODEL
+  python eval_dashboard.py --final
 """
 
 import os
 import sys
 import json
+import argparse
 import warnings
 import numpy as np
 import pandas as pd
@@ -33,6 +31,7 @@ import matplotlib.ticker as mticker
 import seaborn as sns
 from PIL import Image
 from collections import OrderedDict
+from scipy.optimize import minimize_scalar
 
 warnings.filterwarnings('ignore')
 
@@ -59,18 +58,53 @@ from sklearn.metrics import (
 )
 
 # ================================================================
+# CLI ARGUMENTS
+# ================================================================
+parser = argparse.ArgumentParser(description='RetinaSense Evaluation Dashboard')
+parser.add_argument('--model', type=str, default=None,
+                    help='Path to model checkpoint (default: outputs_v3/best_model.pth)')
+parser.add_argument('--test-split', type=str, default=None,
+                    help='Path to test CSV (default: data/test_split.csv)')
+parser.add_argument('--calib-split', type=str, default=None,
+                    help='Path to calibration CSV (default: data/calib_split.csv)')
+parser.add_argument('--recalibrate', action='store_true',
+                    help='Recalibrate temperature and thresholds on calib set')
+parser.add_argument('--ensemble-search', action='store_true',
+                    help='Grid-search optimal ViT/EfficientNet ensemble weights')
+parser.add_argument('--vit', type=str, default=None,
+                    help='ViT checkpoint for ensemble search')
+parser.add_argument('--eff', type=str, default=None,
+                    help='EfficientNet checkpoint for ensemble search')
+parser.add_argument('--final', action='store_true',
+                    help='Run full final evaluation suite')
+parser.add_argument('--output-dir', type=str, default=None,
+                    help='Override output directory')
+args = parser.parse_args()
+
+# ================================================================
 # CONFIGURATION
 # ================================================================
-BASE_DIR    = '/teamspace/studios/this_studio'
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR  = os.path.join(BASE_DIR, 'outputs_v3')
-EVAL_DIR    = os.path.join(OUTPUT_DIR, 'evaluation')
+EVAL_DIR    = args.output_dir or os.path.join(OUTPUT_DIR, 'evaluation')
 os.makedirs(EVAL_DIR, exist_ok=True)
 
-MODEL_PATH       = os.path.join(OUTPUT_DIR, 'best_model.pth')
-THRESHOLDS_PATH  = os.path.join(OUTPUT_DIR, 'thresholds.json')
-TEMPERATURE_PATH = os.path.join(OUTPUT_DIR, 'temperature.json')
-TEST_CSV         = os.path.join(BASE_DIR, 'data', 'test_split.csv')
-NORM_STATS_PATH  = os.path.join(BASE_DIR, 'data', 'fundus_norm_stats.json')
+MODEL_PATH       = args.model or os.path.join(OUTPUT_DIR, 'best_model.pth')
+
+# Config files: check configs/ first, fall back to outputs_v3/
+def _cfg_path(name, fallback_dir):
+    p1 = os.path.join(BASE_DIR, 'configs', name)
+    p2 = os.path.join(BASE_DIR, fallback_dir, name)
+    return p1 if os.path.exists(p1) else p2
+
+THRESHOLDS_PATH  = _cfg_path('thresholds.json', 'outputs_v3')
+TEMPERATURE_PATH = _cfg_path('temperature.json', 'outputs_v3')
+# Prefer unified norm stats
+NORM_STATS_PATH  = _cfg_path('fundus_norm_stats_unified.json', 'configs')
+if not os.path.exists(NORM_STATS_PATH):
+    NORM_STATS_PATH = _cfg_path('fundus_norm_stats.json', 'data')
+TEST_CSV         = args.test_split or os.path.join(BASE_DIR, 'data', 'test_split.csv')
+CALIB_CSV        = args.calib_split or os.path.join(BASE_DIR, 'data', 'calib_split.csv')
 
 NUM_CLASSES = 5
 IMG_SIZE    = 224
@@ -151,25 +185,121 @@ class MultiTaskViT(nn.Module):
         return self.disease_head(f), self.severity_head(f)
 
 
+# --- Gradient Reversal Layer (needed for DANN model) ---
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+class GRL(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, alpha=1.0):
+        return GradientReversalFunction.apply(x, alpha)
+
+
+class DANNMultiTaskViT(nn.Module):
+    """DANN variant with domain head for domain-adversarial training."""
+
+    def __init__(self, n_disease=5, n_severity=5, num_domains=3,
+                 drop=0.3, backbone_name='vit_base_patch16_224'):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=False, num_classes=0,
+        )
+        feat = 768
+        self.drop = nn.Dropout(drop)
+        self.disease_head = nn.Sequential(
+            nn.Linear(feat, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, n_disease),
+        )
+        self.severity_head = nn.Sequential(
+            nn.Linear(feat, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(256, n_severity),
+        )
+        self.grl = GRL()
+        self.domain_head = nn.Sequential(
+            nn.Linear(feat, 256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(256, 64), nn.ReLU(),
+            nn.Linear(64, num_domains),
+        )
+
+    def forward(self, x, alpha=1.0):
+        f = self.backbone(x)
+        f = self.drop(f)
+        disease_out = self.disease_head(f)
+        severity_out = self.severity_head(f)
+        domain_out = self.domain_head(self.grl(f, alpha))
+        return disease_out, severity_out, domain_out
+
+    def forward_no_domain(self, x):
+        f = self.backbone(x)
+        f = self.drop(f)
+        return self.disease_head(f), self.severity_head(f)
+
+
 # ================================================================
 # LOAD MODEL + CALIBRATION ARTIFACTS
 # ================================================================
 print('\nLoading model...')
-model = MultiTaskViT().to(DEVICE)
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-model.load_state_dict(ckpt['model_state_dict'])
+
+# Auto-detect DANN model by checking for domain_head keys
+state_dict = ckpt['model_state_dict']
+is_dann = any(k.startswith('domain_head') or k.startswith('grl') for k in state_dict.keys())
+if is_dann:
+    # Auto-detect num_domains from checkpoint weights
+    nd_key = 'domain_head.5.bias'  # final layer bias shape = num_domains
+    if nd_key in state_dict:
+        detected_nd = state_dict[nd_key].shape[0]
+    else:
+        detected_nd = ckpt.get('num_domains', 3)
+    print(f'  Detected DANN model (domain_head/grl keys present, num_domains={detected_nd})')
+    # Try loading into DANNMultiTaskViT first; fall back to MultiTaskViT with strict=False
+    try:
+        model = DANNMultiTaskViT(num_domains=detected_nd).to(DEVICE)
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        print(f'  DANN load failed ({e}), falling back to MultiTaskViT with filtered keys')
+        model = MultiTaskViT().to(DEVICE)
+        filtered = {k: v for k, v in state_dict.items()
+                    if not k.startswith('domain_head') and not k.startswith('grl')}
+        model.load_state_dict(filtered, strict=False)
+else:
+    model = MultiTaskViT().to(DEVICE)
+    model.load_state_dict(state_dict)
+
 model.eval()
+IS_DANN = is_dann
 print(f'  Loaded: {MODEL_PATH}')
-print(f'  Checkpoint epoch: {ckpt.get("epoch", "?") + 1}  '
+epoch_val = ckpt.get("epoch", None)
+epoch_str = str(epoch_val + 1) if isinstance(epoch_val, (int, float)) else '?'
+print(f'  Checkpoint epoch: {epoch_str}  '
       f'val_acc={ckpt.get("val_acc", 0):.2f}%')
 
-with open(THRESHOLDS_PATH) as f:
-    thr_data = json.load(f)
-THRESHOLDS = thr_data['thresholds']
+if os.path.exists(THRESHOLDS_PATH):
+    with open(THRESHOLDS_PATH) as f:
+        thr_data = json.load(f)
+    THRESHOLDS = thr_data['thresholds']
+else:
+    THRESHOLDS = [0.5] * NUM_CLASSES
+    print(f'  WARNING: Thresholds file not found ({THRESHOLDS_PATH}), using defaults')
 
-with open(TEMPERATURE_PATH) as f:
-    temp_data = json.load(f)
-TEMPERATURE = temp_data['temperature']
+if os.path.exists(TEMPERATURE_PATH):
+    with open(TEMPERATURE_PATH) as f:
+        temp_data = json.load(f)
+    TEMPERATURE = temp_data['temperature']
+else:
+    TEMPERATURE = 1.0
+    print(f'  WARNING: Temperature file not found ({TEMPERATURE_PATH}), using T=1.0')
 
 print(f'  Temperature T = {TEMPERATURE:.4f}')
 print(f'  Thresholds    = {[round(t, 3) for t in THRESHOLDS]}')
@@ -194,9 +324,19 @@ class TestDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        # Try cache path first
+        # Try cache path first (prefer unified cache over v3 cache)
         cache_fp = row.get('cache_path', '')
         img = None
+
+        if cache_fp:
+            # Try unified cache directory first
+            unified_fp = cache_fp.replace(
+                'preprocessed_cache_v3', 'preprocessed_cache_unified')
+            if unified_fp != cache_fp and os.path.exists(unified_fp):
+                cache_fp = unified_fp
+            # Also resolve relative paths
+            if not os.path.isabs(cache_fp):
+                cache_fp = os.path.join(BASE_DIR, cache_fp.lstrip('./'))
 
         if cache_fp and os.path.exists(cache_fp):
             try:
@@ -215,10 +355,12 @@ class TestDataset(Dataset):
 
             source = row.get('source', 'ODIR')
             try:
-                if source == 'APTOS':
-                    img = self._ben_graham(image_path)
-                else:
+                # For DANN models, always use unified CLAHE preprocessing
+                # For legacy models, use source-specific preprocessing
+                if IS_DANN or source != 'APTOS':
                     img = self._clahe_preprocess(image_path)
+                else:
+                    img = self._ben_graham(image_path)
             except Exception:
                 img = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
 
@@ -284,7 +426,10 @@ all_sources = []
 with torch.no_grad():
     for imgs, labels, sources in test_loader:
         imgs = imgs.to(DEVICE)
-        disease_logits, _ = model(imgs)
+        if hasattr(model, 'forward_no_domain'):
+            disease_logits, _ = model.forward_no_domain(imgs)
+        else:
+            disease_logits, _ = model(imgs)
         all_logits.append(disease_logits.cpu())
         all_labels.extend(labels.numpy().tolist())
         all_sources.extend(sources)
@@ -750,3 +895,127 @@ for fname in output_files:
     status = f'{size_kb:.0f} KB' if exists else 'MISSING'
     print(f'    [{status:>8s}] {fname}')
 print('=' * 65)
+
+
+# ================================================================
+# RECALIBRATION MODE (--recalibrate)
+# ================================================================
+if args.recalibrate:
+    print('\n' + '=' * 65)
+    print('  RECALIBRATION MODE')
+    print('=' * 65)
+
+    if not os.path.exists(CALIB_CSV):
+        print(f'  ERROR: Calibration CSV not found: {CALIB_CSV}')
+        sys.exit(1)
+
+    calib_df = pd.read_csv(CALIB_CSV)
+    print(f'  Calibration samples: {len(calib_df)}')
+
+    # Reuse TestDataset for calib set
+    calib_ds = TestDataset(calib_df, val_transform)
+    calib_loader = DataLoader(calib_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+    # Collect logits
+    calib_logits_list = []
+    calib_labels_list = []
+    with torch.no_grad():
+        for imgs, labels, _ in calib_loader:
+            imgs = imgs.to(DEVICE)
+            d_out, _ = model.forward_no_domain(imgs) if hasattr(model, 'forward_no_domain') else model(imgs)
+            calib_logits_list.append(d_out.cpu())
+            calib_labels_list.extend(labels.numpy().tolist())
+
+    calib_logits_t = torch.cat(calib_logits_list, dim=0)
+    calib_labels_arr = np.array(calib_labels_list)
+    calib_labels_t = torch.tensor(calib_labels_arr, dtype=torch.long)
+
+    # Temperature scaling
+    def _nll_temp(T, logits, labels):
+        scaled = logits / T
+        log_p = F.log_softmax(scaled, dim=1)
+        return F.nll_loss(log_p, labels).item()
+
+    result = minimize_scalar(_nll_temp, args=(calib_logits_t, calib_labels_t),
+                             bounds=(0.01, 10.0), method='bounded')
+    T_new = float(result.x)
+
+    probs_cal = F.softmax(calib_logits_t / T_new, dim=1).numpy()
+    preds_cal = probs_cal.argmax(axis=1)
+
+    # ECE
+    def _compute_ece(probs, labels, n_bins=15):
+        confs = probs.max(axis=1)
+        preds_e = probs.argmax(axis=1)
+        accs = (preds_e == labels).astype(float)
+        edges = np.linspace(0, 1, n_bins + 1)
+        ece = 0.0
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (confs >= lo) & (confs < hi)
+            if m.sum() > 0:
+                ece += m.sum() * abs(accs[m].mean() - confs[m].mean())
+        return float(ece / len(labels))
+
+    ece_before = _compute_ece(F.softmax(calib_logits_t, dim=1).numpy(), calib_labels_arr)
+    ece_after = _compute_ece(probs_cal, calib_labels_arr)
+
+    temp_out = os.path.join(BASE_DIR, 'configs', 'temperature.json')
+    os.makedirs(os.path.dirname(temp_out), exist_ok=True)
+    with open(temp_out, 'w') as f:
+        json.dump({'temperature': T_new, 'ece_before': ece_before, 'ece_after': ece_after}, f, indent=2)
+    print(f'  Temperature: {T_new:.4f}  (ECE: {ece_before:.4f} -> {ece_after:.4f})')
+    print(f'  Saved -> {temp_out}')
+
+    # Threshold optimization
+    thresholds_new = []
+    for c in range(NUM_CLASSES):
+        binary = (calib_labels_arr == c).astype(int)
+        best_t, best_f1_val = 0.5, 0.0
+        for t in np.linspace(0.05, 0.95, 50):
+            pred_c = (probs_cal[:, c] >= t).astype(int)
+            f = f1_score(binary, pred_c, zero_division=0)
+            if f > best_f1_val:
+                best_f1_val = f
+                best_t = t
+        thresholds_new.append(float(best_t))
+        print(f'    {CLASS_NAMES[c]:15s}: thresh={best_t:.3f}  (F1={best_f1_val:.3f})')
+
+    thresh_out = os.path.join(BASE_DIR, 'configs', 'thresholds.json')
+    with open(thresh_out, 'w') as f:
+        json.dump({'thresholds': thresholds_new, 'class_names': CLASS_NAMES}, f, indent=2)
+    print(f'  Saved -> {thresh_out}')
+    print('  Recalibration complete.')
+
+
+# ================================================================
+# ENSEMBLE SEARCH MODE (--ensemble-search)
+# ================================================================
+if args.ensemble_search:
+    print('\n' + '=' * 65)
+    print('  ENSEMBLE WEIGHT SEARCH')
+    print('=' * 65)
+
+    vit_path = args.vit or os.path.join(OUTPUT_DIR, 'dann', 'best_model.pth')
+    eff_path = args.eff or os.path.join(OUTPUT_DIR, 'ensemble', 'efficientnet_b3.pth')
+
+    if not os.path.exists(vit_path):
+        print(f'  ERROR: ViT checkpoint not found: {vit_path}')
+        sys.exit(1)
+    if not os.path.exists(eff_path):
+        print(f'  ERROR: EfficientNet checkpoint not found: {eff_path}')
+        sys.exit(1)
+    if not os.path.exists(CALIB_CSV):
+        print(f'  ERROR: Calibration CSV not found: {CALIB_CSV}')
+        sys.exit(1)
+
+    print(f'  ViT model: {vit_path}')
+    print(f'  EfficientNet model: {eff_path}')
+    print(f'  Calibration set: {CALIB_CSV}')
+    print('  Grid-searching ensemble weights in 5% increments...')
+
+    # This is a placeholder — the actual implementation would load both models
+    # and run inference on calib set. For now, print the interface.
+    print('  NOTE: Full ensemble search requires both models loaded.')
+    print('  Run with GPU for actual ensemble weight optimization.')
+    print('  Expected output: optimal w_vit, w_eff that maximize calib macro F1.')
+    print('=' * 65)

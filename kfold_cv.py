@@ -48,12 +48,17 @@ MIXUP_ALPHA  = 0.4
 FOCAL_GAMMA  = 1.0
 GRAD_ACCUM   = 2
 NUM_WORKERS  = 4
-CACHE_DIR  = './preprocessed_cache_v3'
+CACHE_DIR  = './preprocessed_cache_unified'
 OUTPUT_DIR = './outputs_v3/kfold'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-with open('./data/fundus_norm_stats.json') as f:
-    ns = json.load(f)
+_norm_candidates = ['configs/fundus_norm_stats_unified.json', 'configs/fundus_norm_stats.json', 'data/fundus_norm_stats.json']
+for _np in _norm_candidates:
+    if os.path.exists(_np):
+        with open(_np) as f:
+            ns = json.load(f)
+        print(f'  Norm stats from {_np}')
+        break
 NORM_MEAN, NORM_STD = ns['mean_rgb'], ns['std_rgb']
 
 print('=' * 65)
@@ -107,6 +112,10 @@ class RetinalDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         cache_fp = row.get('cache_path', _cache_key(row['image_path']))
+        # Try unified cache first
+        unified_fp = cache_fp.replace('preprocessed_cache_v3', 'preprocessed_cache_unified')
+        if os.path.exists(unified_fp):
+            cache_fp = unified_fp
         try:
             img = np.load(cache_fp)
         except Exception:

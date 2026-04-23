@@ -4,7 +4,7 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-A production-ready deep learning system for multi-disease retinal classification achieving **84.48% accuracy** using Vision Transformers.
+A production-ready deep learning system for multi-disease retinal classification achieving **89.30% accuracy** and **0.886 macro F1** using Vision Transformers with Domain-Adversarial Neural Network (DANN) training.
 
 ## 🎯 Project Overview
 
@@ -16,73 +16,128 @@ RetinaSense-ViT is an AI-powered system for automated detection of five major re
 - **Age-related Macular Degeneration (AMD)**
 
 ### Key Achievements
-- ✅ **84.48% accuracy** on validation set
-- ✅ **0.840 macro F1** across all classes
-- ✅ **+32% relative improvement** from baseline (63.52% → 84.48%)
-- ✅ **Production-ready** with optimized inference pipeline
+- **89.30% accuracy** on test set (DANN-v3 model)
+- **0.886 macro F1** across all classes
+- **0.975 macro AUC-ROC**
+- **+40.6% relative improvement** from baseline (63.52% → 89.30%)
+- **Retrieval-Augmented Diagnosis (RAD)**: 94.0% combined accuracy (+4.9%) via FAISS kNN retrieval (MAP=0.921)
+- **Confidence routing**: Auto-reports 76.9% of cases at 96.8% accuracy, catches 77.2% of errors
+- **Domain-adversarial training (DANN)** eliminates APTOS/ODIR domain shift
+- **Production-ready** with Gradio web demo, FastAPI server, and Docker deployment
+- **IEEE paper ready**: 700-line LaTeX paper with all GPU experiment results
 
-## 📊 Performance Metrics
+## Performance Metrics
 
-| Model | Accuracy | Macro F1 | Best Use Case |
-|-------|----------|----------|---------------|
-| **ViT + Thresholds** (Recommended) | **84.48%** | **0.840** | General screening |
-| ViT Raw | 82.26% | 0.821 | Research baseline |
-| Ensemble | 80.44% | 0.858 | Maximum rare disease detection |
+| Model | Accuracy | Macro F1 | AUC | Best Use Case |
+|-------|----------|----------|-----|---------------|
+| **DANN-v3 ViT** (Production) | **89.30%** | **0.886** | **0.975** | General screening |
+| DANN-v2 ViT | 86.1% | 0.871 | 0.962 | Previous production |
+| DANN-v1 ViT | 86.1% | 0.867 | 0.962 | Alternative |
+| 3-Model Ensemble | 84.8% | 0.840 | -- | Ensemble diversity |
+| ViT + Thresholds (pre-DANN) | 84.48% | 0.840 | 0.967 | Research baseline |
 
-### Per-Class Performance
+### Per-Class Performance (DANN-v3)
 
-| Disease | F1 Score | Precision | Recall |
-|---------|----------|-----------|--------|
-| Normal | 0.746 | 0.707 | 0.789 |
-| Diabetes/DR | 0.891 | 0.918 | 0.865 |
-| Glaucoma | 0.871 | 0.900 | 0.844 |
-| Cataract | 0.874 | 0.906 | 0.844 |
-| AMD | 0.819 | 0.891 | 0.759 |
+| Disease | F1 Score | Notes |
+|---------|----------|-------|
+| Diabetes/DR | 0.920 | Significant improvement over DANN-v2 (0.890) |
+| Glaucoma | 0.833 | |
+| Cataract | 0.899 | |
+| AMD | 0.923 | |
+| Normal | 0.853 | Major improvement over DANN-v2 (0.762) |
+
+### Retrieval-Augmented Diagnosis (RAD) Pipeline
+
+| Metric | Value |
+|--------|-------|
+| Mean Average Precision (MAP) | 0.921 |
+| Recall@1 | 94.0% |
+| RAD Combined Accuracy (K=1) | **94.0%** (+4.9% over standalone) |
+| Auto-Report Tier | 76.9% of cases at 96.8% accuracy |
+| Error Catch Rate | 77.2% |
+
+### Controlled Ablation Study (GPU-trained)
+
+| Model Variant | Accuracy | Macro F1 | AUC |
+|---------------|----------|----------|-----|
+| Base ViT (no DANN) | 85.28% | 0.843 | 0.944 |
+| DANN only | 84.73% | 0.843 | 0.937 |
+| DANN + hard mining | 85.89% | 0.849 | 0.947 |
+| DANN + mixup | 84.66% | 0.821 | 0.931 |
+| **DANN-v3 (full pipeline)** | **89.09%** | **0.879** | **0.972** |
+
+### K-Fold Cross-Validation (5-fold)
+
+| Metric | Value |
+|--------|-------|
+| Accuracy | 82.4% +/- 1.9% |
+| Macro F1 | 0.827 +/- 0.019 |
+| Macro AUC | 0.948 +/- 0.008 |
 
 ## 🏗️ Architecture
 
-**Vision Transformer (ViT-Base-Patch16-224)** with multi-task learning:
-- Pre-trained on ImageNet
-- 86M parameters
+**Vision Transformer (ViT-Base-Patch16-224)** with multi-task learning and domain-adversarial training:
+- Pre-trained on ImageNet-21k, 86M parameters
 - 768-dimensional feature vectors
 - Separate heads for disease classification and severity grading
+- **Domain-Adversarial Neural Network (DANN)** with Gradient Reversal Layer for domain-invariant features
 
 ### Key Technical Features
-- **Ben Graham Preprocessing**: Specialized fundus image preprocessing
-- **Focal Loss**: Handles severe class imbalance (21:1 ratio)
+- **DANN Domain Adaptation**: Gradient Reversal Layer eliminates APTOS/ODIR domain shift (APTOS accuracy: 26.5% -> 99.8%)
+- **Unified CLAHE Preprocessing**: Consistent contrast enhancement across all data sources
+- **Focal Loss with DR Alpha Boost**: Handles severe class imbalance (21:1 ratio) with 2.5x weight boost for DR
+- **Temperature Scaling**: Post-hoc calibration (T=0.566, ECE=0.034)
 - **Threshold Optimization**: Per-class decision thresholds
+- **FAISS Similar Case Retrieval**: Find visually similar cases from the training set for clinical context
 - **Mixed Precision Training**: Faster training with AMP
 - **Gradient Accumulation**: Effective batch size of 64
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 retinasense/
-├── 📓 Notebooks
-│   ├── RetinaSense_Production.ipynb       # Production inference (⭐ START HERE)
-│   ├── RetinaSense_ViT_Training.ipynb     # Complete training process
-│   └── RetinaSense_Optimized.ipynb        # Optimization experiments
+├── Core Training
+│   ├── retinasense_v3.py               # Main ViT training script (1220 lines)
+│   ├── train_dann.py                   # DANN domain-adversarial training
+│   ├── train_dann_v3.py               # DANN-v3 training (89.30% acc)
+│   ├── unified_preprocessing.py        # Unified CLAHE preprocessing pipeline
+│   ├── train_ensemble.py               # EfficientNet-B3 + ensemble training
+│   ├── kfold_cv.py                     # 5-fold cross-validation
+│   ├── app.py                          # Gradio web demo (port 7860)
+│   └── api/main.py                     # FastAPI REST server (port 8000)
 │
-├── 🐍 Training Scripts
-│   ├── retinasense_vit.py                 # ViT training (84.48% accuracy)
-│   ├── retinasense_v2_extended.py         # Extended CNN training
-│   └── retinasense_fixed.py               # Original fixed version
+├── RAD Pipeline
+│   ├── rebuild_faiss_full.py           # Rebuild FAISS index (all 5 classes)
+│   ├── rad_evaluation.py              # Recall@K, MAP, kNN evaluation
+│   ├── confidence_routing.py          # 3-tier clinical triage system
+│   └── run_paper_experiments.py       # LODO + ablation master script
 │
-├── 🔧 Optimization Scripts
-│   ├── threshold_optimization_vit.py      # Per-class thresholds (+2% boost)
-│   ├── ensemble_inference.py              # Model ensemble evaluation
-│   ├── tta_evaluation.py                  # Test-time augmentation
-│   └── data_analysis.py                   # Dataset analysis
+├── Evaluation & XAI
+│   ├── eval_dashboard.py               # Full evaluation suite
+│   ├── gradcam_v3.py                   # Attention Rollout XAI
+│   ├── mc_dropout_uncertainty.py       # MC Dropout uncertainty quantification
+│   ├── integrated_gradients_xai.py     # Integrated Gradients XAI
+│   └── fairness_analysis.py            # Domain fairness analysis
 │
-├── 📊 Research Documentation
-│   ├── PRODUCTION_MODEL_DECISION.md       # Final model selection
-│   ├── COMPLETE_RESEARCH_REPORT.md        # Full research journey
-│   ├── TRAINING_NOTEBOOK_GUIDE.md         # Training guide
-│   └── FINAL_RESULTS_COMPARISON.md        # Performance comparison
+├── paper/
+│   └── retinasense_ieee.tex           # IEEE conference paper (700 lines, complete)
 │
-└── 📚 Additional Docs
-    ├── README.md                           # This file
-    └── .gitignore                          # Git ignore rules
+├── configs/
+│   ├── temperature.json                # T=0.566 calibration
+│   ├── thresholds.json                 # Per-class decision thresholds
+│   └── fundus_norm_stats_unified.json  # Dataset normalization stats
+│
+├── outputs_v3/
+│   ├── dann_v3/best_model.pth          # Production DANN-v3 model
+│   ├── retrieval/index_flat_ip.faiss   # FAISS index (8,241 vectors, 5 classes)
+│   ├── retrieval/*_results.json        # RAD + routing evaluation results
+│   ├── lodo_results.json               # LODO validation results
+│   ├── ablation_results.json           # Ablation study results
+│   └── evaluation/, xai/, fairness/    # Analysis outputs
+│
+├── RUN.md                              # Complete run guide
+├── SESSION_CONTEXT.md                  # Session history + resume file
+└── README.md                           # This file
 ```
 
 ## 🚀 Quick Start
@@ -149,7 +204,7 @@ python threshold_optimization_vit.py
 
 ## 📈 Research Journey
 
-Our research achieved a **+32% relative improvement** through systematic optimization:
+Our research achieved a **+40.6% relative improvement** through systematic optimization:
 
 ```
 Phase 0: Original Baseline
@@ -169,10 +224,18 @@ Phase 3: ViT Architecture (+6 min) ⭐
 └─ Insight: Architecture matters most
 
 Phase 4: ViT + Threshold Opt (+2 min)
-├─ 84.48% accuracy (+20.96%) 🏆
-└─ PRODUCTION READY
+├─ 84.48% accuracy (+20.96%)
+└─ First production model
 
-Total Time: ~45 min active research + 2-3 hours training
+Phase 5: DANN-v2 Domain Adaptation
+├─ 86.1% accuracy (+22.58%)
+└─ Domain-adversarial training eliminates APTOS/ODIR shift
+
+Phase 6: DANN-v3 + Expanded Dataset 🏆
+├─ 89.30% accuracy (+25.78%)
+└─ Hard-example mining, mixup, cosine annealing, MESSIDOR-2 data
+
+Total Time: ~45 min active research + 4-5 hours training
 ```
 
 ## 🔬 Key Research Insights
@@ -183,11 +246,11 @@ Total Time: ~45 min active research + 2-3 hours training
 4. **Domain Shift Matters**: APTOS images 10x lower quality than ODIR
 5. **Ensemble Trade-offs**: Sacrifices 4% accuracy for +10% minority F1
 
-## 📊 Dataset
+## Dataset
 
-- **Sources**: ODIR-5K + APTOS-2019
-- **Total Images**: 8,540 fundus images
-- **Resolution**: 224×224 (preprocessed)
+- **Sources**: ODIR-5K + APTOS-2019 + REFUGE2 + MESSIDOR-2
+- **Total Images**: 11,524 fundus images (APTOS=3,662 + ODIR=4,878 + REFUGE2=1,200 + MESSIDOR-2=1,744)
+- **Resolution**: 224x224 (preprocessed with unified CLAHE)
 - **Class Distribution**:
   - Normal: 2,071 (24%)
   - Diabetes/DR: 5,581 (65%)
@@ -195,7 +258,7 @@ Total Time: ~45 min active research + 2-3 hours training
   - Cataract: 315 (4%)
   - AMD: 265 (3%)
 
-**Challenge**: Severe class imbalance (21:1 ratio)
+**Challenge**: Severe class imbalance (21:1 ratio) and cross-dataset domain shift (10.7x sharpness difference between APTOS and ODIR)
 
 ## 🛠️ Technical Stack
 
@@ -213,23 +276,24 @@ Total Time: ~45 min active research + 2-3 hours training
 
 Comprehensive documentation available:
 
-- **[PRODUCTION_MODEL_DECISION.md](PRODUCTION_MODEL_DECISION.md)**: Final model selection rationale
-- **[TRAINING_NOTEBOOK_GUIDE.md](TRAINING_NOTEBOOK_GUIDE.md)**: Complete training guide
-- **[COMPLETE_RESEARCH_REPORT.md](COMPLETE_RESEARCH_REPORT.md)**: Full research journey (35+ pages)
-- **[FINAL_RESULTS_COMPARISON.md](FINAL_RESULTS_COMPARISON.md)**: Model comparison
+- **[paper/retinasense_ieee.tex](paper/retinasense_ieee.tex)**: IEEE conference paper (700 lines, 13 tables, 30 refs)
+- **[RUN.md](RUN.md)**: Complete run guide for training, evaluation, and deployment
+- **[SESSION_CONTEXT.md](SESSION_CONTEXT.md)**: Session history and resume file
+- **[ARCHITECTURE_DOCUMENT.md](ARCHITECTURE_DOCUMENT.md)**: System architecture document
 
 ## 🎯 Use Cases
 
 ### Primary Use Case: General Screening
-- **Model**: ViT + Threshold Optimization
-- **Accuracy**: 84.48%
+- **Model**: DANN-v3 ViT + Threshold Optimization
+- **Accuracy**: 89.30%
+- **Macro F1**: 0.886
 - **Speed**: ~15ms per image (66 images/sec)
 - **Best for**: High-volume clinics, community health programs
 
 ### Alternative Use Case: Rare Disease Detection
-- **Model**: Ensemble + ViT Thresholds
-- **Accuracy**: 80.44%
-- **Macro F1**: 0.858 (best minorities)
+- **Model**: 3-Model Ensemble (DANN-v1 30% + DANN-v3 50% + EfficientNet 20%)
+- **Accuracy**: 84.8%
+- **Macro F1**: 0.840
 - **Best for**: Academic medical centers, research studies
 
 ## 🔒 Clinical Considerations
@@ -237,25 +301,28 @@ Comprehensive documentation available:
 ⚠️ **Important**: This system is intended for research and educational purposes. Not FDA-approved for clinical use. Always consult qualified ophthalmologists for diagnosis.
 
 ### Strengths
-- ✅ High sensitivity for diabetic retinopathy (89% F1)
-- ✅ Excellent glaucoma detection (87% F1)
-- ✅ Fast inference (15ms per image)
-- ✅ Handles class imbalance well
+- High sensitivity for diabetic retinopathy (92.0% F1 with DANN-v3)
+- Excellent AMD detection (92.3% F1 with DANN-v3)
+- Excellent glaucoma detection (83.3% F1)
+- Strong Normal class detection (85.3% F1, up from 76.2%)
+- Domain-invariant features via DANN (handles APTOS/ODIR shift)
+- Fast inference (15ms per image)
+- Well-calibrated predictions (ECE=0.034)
 
 ### Limitations
-- ⚠️ Lower performance on rare diseases (AMD: 82% F1)
-- ⚠️ Trained primarily on Asian populations (ODIR dataset)
-- ⚠️ May not generalize to different imaging equipment
-- ⚠️ Requires high-quality fundus images
+- Trained primarily on Asian populations (ODIR + APTOS datasets)
+- LODO validation shows 51.8% on ODIR holdout (most heterogeneous source)
+- Requires high-quality fundus images
+- No prospective clinical validation yet
 
-## 🤝 Contributing
+## Contributing
 
 Contributions welcome! Areas for improvement:
-- External validation on new datasets
+- External validation on new datasets (ADAM, additional MESSIDOR-2 subsets)
 - Support for additional diseases
-- Deployment optimization (TensorRT, ONNX)
+- Knowledge distillation (ViT-Base -> ViT-Tiny + ONNX)
 - Mobile/edge deployment
-- Explainability (Grad-CAM, attention maps)
+- Pushing toward 92%+ accuracy with further ensemble and TTA refinements
 
 ## 📄 License
 
@@ -263,9 +330,10 @@ This project is licensed under the MIT License - see LICENSE file for details.
 
 ## 🙏 Acknowledgments
 
-- **Datasets**: ODIR-5K, APTOS-2019
+- **Datasets**: ODIR-5K, APTOS-2019, REFUGE2, MESSIDOR-2
 - **Architecture**: Vision Transformer (ViT) by Google Research
-- **Preprocessing**: Ben Graham method from Kaggle competitions
+- **Domain Adaptation**: DANN (Ganin et al., 2016) with Gradient Reversal Layer
+- **Preprocessing**: Ben Graham method + unified CLAHE
 - **Framework**: PyTorch, timm library
 
 ## 📧 Contact
@@ -279,17 +347,20 @@ This project is licensed under the MIT License - see LICENSE file for details.
 If you use this work in your research, please cite:
 
 ```bibtex
-@software{retinasense2026,
-  title={RetinaSense-ViT: Deep Learning for Retinal Disease Classification},
-  author={Tanishq},
+@inproceedings{retinasense2026,
+  title={RetinaSense: An Uncertainty-Aware Domain-Adaptive Vision Transformer
+         Framework with Retrieval-Augmented Reasoning for Multi-Disease Retinal Diagnosis},
+  author={Tamarkar, Tanishq and Hussain, Rafae Mohammed and Revathi, M},
   year={2026},
+  institution={SRM Institute of Science and Technology, Chennai, India},
   url={https://github.com/Tanishq74/retina-sense}
 }
 ```
 
 ---
 
-**Last Updated**: February 2026
-**Status**: ✅ Production Ready
-**Performance**: 84.48% accuracy, 0.840 macro F1
+**Last Updated**: March 2026
+**Status**: Production Ready
+**Best Model**: DANN-v3 -- 89.30% accuracy, 0.886 macro F1, 0.975 AUC
+**Production Checkpoint**: `outputs_v3/dann_v3/best_model.pth`
 **License**: MIT
